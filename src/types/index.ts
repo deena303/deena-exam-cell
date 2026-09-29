@@ -19,6 +19,155 @@ export type QuestionPart = 'Part A' | 'Part B' | 'Part C';
 
 export type BloomsLevel = 'K1' | 'K2' | 'K3' | 'K4' | 'K5' | 'K6';
 
+// ============================================================
+// IAT Question Bank Generator (Spec §1–§30)
+// ============================================================
+
+/** The generator is IAT-only. End Semester is never included (Spec §19, §30). */
+export type IatExamType = 'Internal Assessment I' | 'Internal Assessment II';
+
+export const IAT_EXAM_TYPES: IatExamType[] = ['Internal Assessment I', 'Internal Assessment II'];
+
+/** Which bank a paper is built from (Spec §18). */
+export type QuestionBankSource = 'ORIGINAL' | 'IAT_GENERATED';
+
+export type IatGeneratedBankStatus = 'Active' | 'Archived';
+
+/** `question_banks.bank_type` — ORIGINAL rows are uploaded banks. */
+export type QuestionBankType = 'ORIGINAL' | 'IAT_GENERATED';
+
+export interface SourceBankUnitStat {
+  unit: number;
+  partA: number;
+  partB: number;
+  partC: number;
+  total: number;
+}
+
+/** Original Question Bank Statistics (Spec §4, §25). */
+export interface SourceBankStats {
+  questionBankId: string;
+  subjectCode: string;
+  subjectName: string | null;
+  academicYear: string | null;
+  department: string | null;
+  fileName: string;
+  partA: number;
+  partB: number;
+  partC: number;
+  /** Part B + Part C combined pool (Spec §6, §25) */
+  partBc: number;
+  total: number;
+  units: SourceBankUnitStat[];
+}
+
+export interface SelectedIatQuestion {
+  /** The ORIGINAL `questions.id` this was selected from (Spec §12). */
+  sourceQuestionId: string;
+  sourceQuestionNumber: string;
+  questionText: string;
+  /** Always the ORIGINAL part of the source question — never reclassified. */
+  originalPart: QuestionPart;
+  unit: number | null;
+  marks: number | null;
+  btl: string | null;
+  bloomsLevel: string | null;
+  co: string | null;
+  pi: string | null;
+  difficulty: string | null;
+  orGroupId: string | null;
+  orOption: string | null;
+  sourcePage: number | null;
+  subjectCode: string;
+  orderIndex: number;
+  timesUsed: number;
+}
+
+export interface UnitDistributionRow {
+  unit: number;
+  partA: number;
+  partB: number;
+  partC: number;
+  total: number;
+}
+
+/** Result of the "Generate IAT Question Bank" preview (Spec §14). */
+export interface IatPreview {
+  sourceBankId: string;
+  sourceBankName: string;
+  academicYear: string | null;
+  department: string | null;
+  subjectCode: string;
+  subjectName: string;
+  examType: IatExamType;
+  requestedPartA: number;
+  requestedPartBC: number;
+  actualPartA: number;
+  actualPartB: number;
+  actualPartC: number;
+  totalQuestions: number;
+  partA: SelectedIatQuestion[];
+  partBC: SelectedIatQuestion[];
+  unitDistribution: { partA: UnitDistributionRow[]; partBC: UnitDistributionRow[] };
+  seed: number;
+  selectionMethod: 'deterministic' | 'gemini';
+  suggestedName: string;
+  generatedAt: string;
+}
+
+export interface IatGeneratedBank {
+  id: string;
+  questionBankId: string;
+  sourceQuestionBankId: string;
+  sourceBankName: string | null;
+  academicYear: string | null;
+  department: string | null;
+  subjectCode: string;
+  subjectName: string | null;
+  name: string;
+  requestedPartACount: number;
+  requestedPartBcCount: number;
+  actualPartACount: number;
+  actualPartBCount: number;
+  actualPartCCount: number;
+  totalQuestions: number;
+  status: IatGeneratedBankStatus;
+  selectionMethod: string;
+  createdBy: string | null;
+  createdByName: string | null;
+  createdAt: string;
+  updatedAt: string | null;
+  archivedAt: string | null;
+  archiveReason: string | null;
+}
+
+export interface IatGeneratedBankDetail extends IatGeneratedBank {
+  unitDistribution: { partA: UnitDistributionRow[]; partBC: UnitDistributionRow[] } | null;
+  questions: SelectedIatQuestion[];
+}
+
+/** A generated bank expressed as an IAT paper-generation pool (Spec §18). */
+export interface IatPaperPoolQuestion {
+  sourceQuestionId: string;
+  questionText: string;
+  originalPart: QuestionPart;
+  unit: number | null;
+  marks: number | null;
+  btl: string | null;
+  bloomsLevel: string | null;
+  co: string | null;
+  pi: string | null;
+  difficulty: string | null;
+  subjectCode: string;
+}
+
+export interface IatPaperPool {
+  generatedBankId: string;
+  name: string;
+  totalQuestions: number;
+  questions: IatPaperPoolQuestion[];
+}
+
 export type PaperStatus = 'Draft' | 'Faculty Reviewed' | 'HOD Review' | 'Approved' | 'Finalized' | 'Rejected';
 
 /** Available academic years — now loaded from Supabase, this is a fallback */
@@ -159,6 +308,12 @@ export interface Question {
   departmentScope?: DepartmentScope;
   departmentIds?: string[];
   commonDepartments?: string[];
+  /**
+   * When this question came from a generated IAT bank, this is the ORIGINAL
+   * `questions.id` it was selected from (Spec §12). Usage is recorded
+   * against this id, never against the generated bank.
+   */
+  sourceQuestionId?: string;
 }
 
 export type OcrStatus = 'Approved' | 'Needs Review' | 'Low Confidence' | 'Rejected' | 'Possible Duplicate';
@@ -319,12 +474,30 @@ export interface GeneratedPaper {
   validationPassed: boolean;
   validationIssues: string[];
   setLetter?: string;
+  setName?: string;
   setDisplayName?: string;
+  /** Canonical download filename, e.g. 24CS514_IAT_Set_A.pdf (Spec §5) */
+  fileName?: string;
+  /** Spec §18 — set when the paper used a Principal approval */
+  principalRequestId?: string | null;
+  principalApprovalRequired?: boolean;
+  principalApprovalStatus?: 'not_required' | 'pending' | 'approved' | 'rejected' | 'consumed';
+  generatedBy?: string;
+  generatedAt?: string;
   scope?: DepartmentScope;
   departmentScope?: DepartmentScope;
   departmentIds?: string[];
   commonDepartments?: string[];
   tableOfSpecification?: TableOfSpecification;
+  /**
+   * Which question bank the paper was built from (Spec §18).
+   * End Semester papers are always 'ORIGINAL' — the IAT generator is
+   * never reachable from the End Semester workflow (Spec §19, §30).
+   */
+  questionBankSource?: QuestionBankSource;
+  /** Set only when questionBankSource === 'IAT_GENERATED'. */
+  iatGeneratedBankId?: string | null;
+  iatGeneratedBankName?: string | null;
 }
 
 export interface TosRow {
@@ -378,6 +551,16 @@ export interface PaperSetTrackingEntry {
   paper_code: string | null;
   created_at: string;
   created_by_name: string | null;
+  additional_set_request_id?: string | null;
+}
+
+/** Authoritative set-limit configuration (Spec §3, §15) */
+export interface ExamSetLimitConfig {
+  examType: ExamType;
+  maxSets: number;
+  standardSetNames: string[];
+  limitMessage: string;
+  isIAT: boolean;
 }
 
 export interface PaperSetStatus {
@@ -387,12 +570,19 @@ export interface PaperSetStatus {
   limit: number;
   standardSetNames: string[];
   limitReached: boolean;
-  nextSetName: string;
+  nextSetName: string | null;
   canGenerate: boolean;
+  requiresApproval: boolean;
+  limitMessage: string | null;
   hasValidApproval: boolean;
   approvedSetNamesAvailable: string[];
+  /** The request that actually grants the approved set (Spec §12) */
+  approvalRequest: AdditionalPaperRequest | null;
   activeRequest: AdditionalPaperRequest | null;
+  pendingRequest: AdditionalPaperRequest | null;
+  reason?: string;
   examTypeRule: string;
+  databaseConfigured?: boolean;
 }
 
 // ============================================================
@@ -423,6 +613,15 @@ export interface AdditionalPaperRequest {
   approved_set_count: number | null;
   approved_set_names: string[] | null;
   sets_generated_from_this: number;
+  // Spec §11 — rejection trail
+  rejected_by_id?: string | null;
+  rejected_by_name?: string | null;
+  rejected_at?: string | null;
+  rejection_reason?: string | null;
+  // Spec §12 — approval consumption
+  consumed?: boolean;
+  consumed_at?: string | null;
+  consumed_set_name?: string | null;
   created_at: string;
   updated_at: string;
   // Joined fields

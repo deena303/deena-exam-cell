@@ -1,6 +1,7 @@
 import express, { Response } from 'express';
 import { requireAuth, requireRole, AuthenticatedRequest } from '../middleware/authMiddleware';
 import { getSupabaseClient, isSupabaseConfigured } from '../services/supabaseQuestionBankService';
+import { countQuestionsForSubjects } from '../services/questionCountService';
 
 const router = express.Router();
 
@@ -216,7 +217,93 @@ router.get('/subjects', async (req: AuthenticatedRequest, res: Response) => {
   }
 });
 
-router.post('/subjects', requireAuth, requireRole('SUPER_ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+/**
+ * GET /api/subjects/question-counts
+ *
+ * Real, database-backed question counts scoped to
+ * Academic Year + Department + Subject Code (Spec §9–§13).
+ *
+ * Part of the existing /subjects resource — no duplicate API is created.
+ * A failure is returned as `error`, never as 0 (Spec §15).
+ *
+ * Query: /api/subjects/question-counts?academicYearId=<uuid>&departmentId=<uuid>
+ *   -> { counts: { "24CS514": 80 }, detail: {...}, error: null }
+ */
+router.get('/subjects/question-counts', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (!isSupabaseConfigured()) {
+      return res.json({ counts: {}, detail: {}, error: null, databaseConfigured: false });
+    }
+
+    const client = getSupabaseClient();
+    const { academicYearId, departmentId, subjectCodes } = req.query as Record<string, string>;
+
+    // Resolve the human-readable year label + department code used by
+    // question_banks.academic_year / question_banks.department
+    let academicYear: string | null = null;
+    let departmentCode: string | null = null;
+
+    if (academicYearId) {
+      const { data } = await client.from('academic_years').select('year_label').eq('id', academicYearId).maybeSingle();
+      academicYear = data?.year_label ?? null;
+    }
+    if (departmentId) {
+      const { data } = await client.from('departments').select('department_code').eq('id', departmentId).maybeSingle();
+      departmentCode = data?.department_code ?? null;
+    }
+
+    // Subject codes: either supplied explicitly, or derived from the master
+    // subjects table for the given year + department (Spec §18 — the Exam Cell
+    // must see exactly the subjects Super Admin manages).
+    let codes: string[] = [];
+    if (subjectCodes) {
+      codes = subjectCodes.split(',').map(s => s.trim()).filter(Boolean);
+    } else {
+      let sq = client.from('subjects').select('subject_code, department_id, academic_year_id').eq('status', 'active');
+      if (academicYearId) sq = sq.eq('academic_year_id', academicYearId);
+      if (departmentId) sq = sq.eq('department_id', departmentId);
+      const { data, error } = await sq;
+      if (error) throw error;
+      codes = Array.from(new Set((data || []).map((s: any) => s.subject_code).filter(Boolean)));
+    }
+
+    if (codes.length === 0) {
+      return res.json({ counts: {}, detail: {}, error: null, databaseConfigured: true });
+    }
+
+    const result = await countQuestionsForSubjects({
+      subjectCodes: codes,
+      academicYear,
+      departmentCode
+    });
+
+    if (result.error) {
+      // Explicit failure — the UI shows "Unable to load question count" (Spec §15)
+      return res.status(503).json({
+        error: `Unable to load question counts: ${result.error}`,
+        counts: null,
+        detail: null
+      });
+    }
+
+    return res.json({
+      counts: result.counts,
+      detail: result.detail,
+      error: null,
+      databaseConfigured: true,
+      scope: { academicYear, departmentCode, subjectCount: codes.length }
+    });
+  } catch (err: any) {
+    console.error('[masterData] GET subjects/question-counts:', err?.message);
+    return res.status(503).json({
+      error: `Unable to load question counts: ${err?.message || 'Unknown error'}`,
+      counts: null,
+      detail: null
+    });
+  }
+});
+
+router.post('/subjects', requireAuth, requireRole('SUPER_ADMIN', 'EXAM_CELL'), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { subject_code, subject_name, department_id, academic_year_id, semester, regulation, status, year_of_study, faculty_name, faculty_department } = req.body;
     if (!subject_code || !subject_name || !department_id || !academic_year_id) return res.status(400).json({ error: 'subject_code, subject_name, department_id, academic_year_id are required.' });
@@ -256,7 +343,7 @@ router.post('/subjects', requireAuth, requireRole('SUPER_ADMIN'), async (req: Au
   }
 });
 
-router.put('/subjects/:id', requireAuth, requireRole('SUPER_ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+router.put('/subjects/:id', requireAuth, requireRole('SUPER_ADMIN', 'EXAM_CELL'), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
     const { subject_code, subject_name, department_id, academic_year_id, semester, regulation, status, year_of_study, faculty_name, faculty_department } = req.body;
@@ -284,7 +371,7 @@ router.put('/subjects/:id', requireAuth, requireRole('SUPER_ADMIN'), async (req:
   }
 });
 
-router.delete('/subjects/:id', requireAuth, requireRole('SUPER_ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+router.delete('/subjects/:id', requireAuth, requireRole('SUPER_ADMIN', 'EXAM_CELL'), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
     const client = getSupabaseClient();
@@ -292,10 +379,13 @@ router.delete('/subjects/:id', requireAuth, requireRole('SUPER_ADMIN'), async (r
     if (qbCount && qbCount > 0) {
       const { data, error } = await client.from('subjects').update({ status: 'inactive', updated_at: new Date().toISOString() }).eq('id', id).select().single();
       if (error) throw error;
+      auditLog(req, 'DEACTIVATE_SUBJECT', 'SUCCESS', { id, subject_code: data?.subject_code, reason: 'referenced_by_question_banks' });
       return res.json({ ...data, _action: 'deactivated', message: 'Subject deactivated (referenced by question banks).' });
     }
+    const { data: deletedData } = await client.from('subjects').select('subject_code, subject_name').eq('id', id).single();
     const { error } = await client.from('subjects').delete().eq('id', id);
     if (error) throw error;
+    auditLog(req, 'DELETE_SUBJECT', 'SUCCESS', { id, subject_code: deletedData?.subject_code, subject_name: deletedData?.subject_name });
     return res.json({ id, _action: 'deleted', message: 'Subject deleted.' });
   } catch (err: any) {
     console.error('[masterData] DELETE subjects:', err?.message);
@@ -367,7 +457,77 @@ router.get('/exam-patterns', async (_req: AuthenticatedRequest, res: Response) =
   }
 });
 
-router.put('/exam-patterns/:id', requireAuth, requireRole('SUPER_ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+/**
+ * Computes the total marks of a pattern configuration and validates it
+ * against the declared max_marks (Spec §1 — the system must validate the
+ * total marks before allowing the pattern to be saved).
+ */
+function validatePatternTotals(params: {
+  maxMarks: number;
+  partA?: any;
+  partB?: any;
+  partC?: any;
+}): { valid: boolean; computed: number; breakdown: string; error?: string } {
+  const count = (v: any, fallback = 0) => (v === undefined || v === null || v === '' ? fallback : Number(v));
+  const partA = params.partA || {};
+  const partB = params.partB || {};
+  const partC = params.partC || null;
+
+  const aCount = count(partA.count, partA.totalQuestions);
+  const aMarks = count(partA.marks_per_question, partA.marksPerQuestion);
+  const partATotal = aCount * aMarks;
+
+  let partBTotal = 0;
+  let partBSummary = '';
+  if (partB.format === 'sections' && Array.isArray(partB.sections) && partB.sections.length > 0) {
+    const lines = partB.sections.map((s: any) => {
+      const answer = count(s.answer_count, 0);
+      const perQ = count(s.marks_per_question, partB.marks_per_question);
+      const subtotal = answer * perQ;
+      partBTotal += subtotal;
+      return `${s.name || 'Section'}: ${answer} × ${perQ} = ${subtotal}`;
+    });
+    partBSummary = lines.join(' + ');
+  } else {
+    const orPairs = count(partB.or_pairs, count(partB.orQuestionsCount, 0));
+    const perQ = count(partB.marks_per_question, partB.marksPerQuestion);
+    partBTotal = orPairs * perQ;
+    partBSummary = `Part B: ${orPairs} × ${perQ} = ${partBTotal}`;
+  }
+
+  let partCTotal = 0;
+  let partCSummary = '';
+  if (partC && partC.enabled !== false) {
+    const cCount = count(partC.count, 0);
+    const cMarks = count(partC.marks_per_question, 0);
+    partCTotal = cCount * cMarks;
+    partCSummary = `Part C: ${cCount} × ${cMarks} = ${partCTotal}`;
+  }
+
+  const computed = partATotal + partBTotal + partCTotal;
+  const breakdown = [
+    `Part A: ${aCount} × ${aMarks} = ${partATotal}`,
+    partBSummary,
+    ...(partCSummary ? [partCSummary] : [])
+  ].filter(Boolean).join(' + ');
+
+  const valid = computed === Number(params.maxMarks);
+  return {
+    valid,
+    computed,
+    breakdown,
+    error: valid
+      ? undefined
+      : `Total marks mismatch: Part A + Part B${partCSummary ? ' + Part C' : ''} = ${computed} marks, but Total Marks is set to ${params.maxMarks}. Adjust the section counts, questions to answer, or marks per question so the totals match.`
+  };
+}
+
+/**
+ * PUT /api/exam-patterns/:id
+ * The Exam Cell may edit IAT I, IAT II and End Semester patterns (Spec §1).
+ * Super Admin retains full control.
+ */
+router.put('/exam-patterns/:id', requireAuth, requireRole('EXAM_CELL', 'SUPER_ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
     const {
@@ -383,6 +543,45 @@ router.put('/exam-patterns/:id', requireAuth, requireRole('SUPER_ADMIN'), async 
       instructions,
       status
     } = req.body;
+
+    // ---- Server-side total marks validation (Spec §1) ----
+    if (max_marks !== undefined || part_a_config !== undefined || part_b_config !== undefined || part_c_config !== undefined) {
+      const client0 = getSupabaseClient();
+      const { data: current } = await client0
+        .from('exam_pattern_configs')
+        .select('max_marks, part_a_config, part_b_config, part_c_config, exam_type')
+        .eq('id', id)
+        .maybeSingle();
+
+      if (!current) return res.status(404).json({ error: 'Exam pattern not found.' });
+
+      const effectiveMax = max_marks !== undefined ? Number(max_marks) : Number(current.max_marks);
+      const effectiveA = part_a_config !== undefined ? part_a_config : current.part_a_config;
+      const effectiveB = part_b_config !== undefined ? part_b_config : current.part_b_config;
+      const effectiveC = part_c_config !== undefined ? part_c_config : current.part_c_config;
+
+      if (!Number.isFinite(effectiveMax) || effectiveMax <= 0) {
+        return res.status(400).json({ error: 'Total Marks must be a positive number.' });
+      }
+
+      const check = validatePatternTotals({
+        maxMarks: effectiveMax,
+        partA: effectiveA,
+        partB: effectiveB,
+        partC: effectiveC
+      });
+
+      if (!check.valid) {
+        auditLog(req, 'EXAM_PATTERN_EDIT_REJECTED', 'FAILED', {
+          id,
+          exam_type: current.exam_type,
+          computedTotal: check.computed,
+          declaredTotal: effectiveMax,
+          breakdown: check.breakdown
+        });
+        return res.status(400).json({ error: check.error, computedTotal: check.computed, declaredTotal: effectiveMax, breakdown: check.breakdown });
+      }
+    }
 
     const client = getSupabaseClient();
     const updates: Record<string, any> = { updated_at: new Date().toISOString() };
@@ -407,7 +606,14 @@ router.put('/exam-patterns/:id', requireAuth, requireRole('SUPER_ADMIN'), async 
 
     if (error) throw error;
     if (!data) return res.status(404).json({ error: 'Exam pattern not found.' });
-    auditLog(req, 'UPDATE_EXAM_PATTERN', 'SUCCESS', { id, exam_type: data.exam_type, exam_name: data.exam_name });
+    // Spec §19 — "Pattern edited"
+    auditLog(req, 'EXAM_PATTERN_EDITED', 'SUCCESS', {
+      id,
+      exam_type: data.exam_type,
+      exam_name: data.exam_name,
+      max_marks: data.max_marks,
+      duration: data.duration
+    });
     return res.json(data);
   } catch (err: any) {
     console.error('[masterData] PUT exam-patterns:', err?.message);

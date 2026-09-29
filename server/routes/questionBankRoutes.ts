@@ -15,6 +15,7 @@ import {
   getQuestionBanks
 } from '../services/supabaseQuestionBankService';
 import { checkGeminiConfig } from '../services/geminiConfig';
+import { writeAuditLog, AUDIT_ACTIONS } from '../services/auditService';
 
 const router = express.Router();
 
@@ -185,6 +186,8 @@ router.post(
 
       let questionBankId: string | null = null;
       let storagePath: string | null = null;
+      let persistedQuestionCount = 0;
+      let persistenceError: string | null = null;
 
       // Step 4: Supabase persistence (non-fatal — questions are always returned to frontend)
       if (isSupabaseConfigured()) {
@@ -223,17 +226,41 @@ router.post(
           });
 
           // 4c. Store all extracted questions in Supabase (with status 'Draft')
-          await insertExtractedQuestions(
+          persistedQuestionCount = await insertExtractedQuestions(
             questionBankId,
             effectiveSubjectCode,
             questions
           );
         } catch (dbErr: any) {
-          console.warn('[Supabase] Database persistence failed (non-fatal):', dbErr?.message || dbErr);
+          persistenceError = dbErr?.message || String(dbErr);
+          console.warn('[Supabase] Database persistence failed (non-fatal):', persistenceError);
           console.warn('[Supabase] Extracted questions will still be returned to the frontend.');
           console.warn('[Supabase] To fix RLS (42501): Use the secret service_role key (starts with "eyJ") from Supabase Dashboard > Project Settings > API.');
           // Keep questionBankId so frontend can still reference it locally
         }
+
+        // Spec §27 — audit the ORIGINAL question bank upload. This is the
+        // source bank that IAT reductions are later generated from.
+        await writeAuditLog({
+          userEmail: uploadedBy.toLowerCase().includes('@') ? uploadedBy : 'exam-cell@msajce-edu.in',
+          userName: uploadedBy,
+          role: 'EXAM_CELL',
+          action: AUDIT_ACTIONS.QUESTION_BANK_UPLOADED,
+          status: persistenceError ? 'FAILURE' : 'SUCCESS',
+          metadata: {
+            academic_year: academicYear || null,
+            department: department || null,
+            subject_code: effectiveSubjectCode,
+            subject_name: effectiveSubjectName,
+            source_question_bank_id: questionBankId,
+            file_name: fileName,
+            total_questions: questions.length,
+            persisted_questions: persistedQuestionCount,
+            bank_type: 'ORIGINAL',
+            storage_path: storagePath,
+            error: persistenceError
+          }
+        });
       } else {
         console.log('[Extract] Supabase not configured in .env — skipping database persistence.');
       }

@@ -16,7 +16,12 @@ import {
   Users,
   CalendarDays,
   Building2,
-  ShieldCheck
+  ShieldCheck,
+  Landmark,
+  BellRing,
+  ClipboardCheck,
+  Layers,
+  GitBranch
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 
@@ -31,7 +36,8 @@ export const Sidebar: React.FC<SidebarProps> = ({ mobileOpen, setMobileOpen }) =
     setActiveTab,
     currentUser,
     logout,
-    isSuperAdminPortal
+    isSuperAdminPortal,
+    isPrincipalPortal
   } = useApp();
 
   // ---- Exam Cell navigation items ----
@@ -42,6 +48,8 @@ export const Sidebar: React.FC<SidebarProps> = ({ mobileOpen, setMobileOpen }) =
         { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
         { id: 'import-question-bank', label: 'Import Question Bank', icon: ScanLine, highlight: true },
         { id: 'question-bank', label: 'Question Bank', icon: Database },
+        { id: 'iat-question-bank-generator', label: 'IAT Question Bank Generator', icon: GitBranch, highlight: true },
+        { id: 'iat-generated-banks', label: 'IAT Generated Banks', icon: Layers },
         { id: 'exam-patterns', label: 'Exam Patterns', icon: Sliders },
         { id: 'internal-config', label: 'IA Configuration', icon: SlidersHorizontal },
         { id: 'generate-paper', label: 'Generate Paper', icon: Sparkles, highlight: true },
@@ -73,6 +81,27 @@ export const Sidebar: React.FC<SidebarProps> = ({ mobileOpen, setMobileOpen }) =
     }
   ];
 
+  // ---- Principal Portal (Spec §8) — focused on approval ----
+  const principalSections = [
+    {
+      title: 'Principal Portal',
+      items: [
+        { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
+        { id: 'principal-requests', label: 'Additional Paper Requests', icon: ClipboardCheck, highlight: true },
+        { id: 'principal-papers', label: 'Generated / Assigned Papers', icon: FileCheck2 },
+        { id: 'principal-notifications', label: 'Notifications', icon: BellRing },
+        { id: 'audit-logs', label: 'Audit Logs', icon: ShieldCheck },
+      ]
+    },
+    {
+      title: 'General',
+      items: [
+        { id: 'settings', label: 'Settings', icon: Settings },
+        { id: 'meet-the-team', label: 'Meet the Team', icon: Users },
+      ]
+    }
+  ];
+
   // ---- Super Admin has full administrative + question paper suite access ----
   const superAdminSections = [
     {
@@ -84,6 +113,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ mobileOpen, setMobileOpen }) =
         { id: 'master-subjects', label: 'Master Subjects', icon: BookOpen },
         { id: 'users', label: 'User Accounts', icon: Users },
         { id: 'audit-logs', label: 'Audit Logs', icon: ShieldCheck },
+        { id: 'principal-requests', label: 'Paper Requests', icon: ClipboardCheck },
       ]
     },
     {
@@ -92,6 +122,8 @@ export const Sidebar: React.FC<SidebarProps> = ({ mobileOpen, setMobileOpen }) =
         { id: 'exam-dashboard', label: 'Exam Cell Dashboard', icon: BarChart3 },
         { id: 'import-question-bank', label: 'Import Question Bank', icon: ScanLine, highlight: true },
         { id: 'question-bank', label: 'Question Bank', icon: Database },
+        { id: 'iat-question-bank-generator', label: 'IAT Question Bank Generator', icon: GitBranch, highlight: true },
+        { id: 'iat-generated-banks', label: 'IAT Generated Banks', icon: Layers },
         { id: 'subject-bank', label: 'Subject Bank', icon: BookOpen },
         { id: 'exam-patterns', label: 'Exam Patterns', icon: Sliders },
         { id: 'internal-config', label: 'IA Configuration', icon: SlidersHorizontal },
@@ -110,7 +142,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ mobileOpen, setMobileOpen }) =
     }
   ];
 
-  const sections = isSuperAdminPortal ? superAdminSections : examCellSections;
+  const sections = isPrincipalPortal ? principalSections : isSuperAdminPortal ? superAdminSections : examCellSections;
 
   const handleNavClick = (id: string) => {
     setActiveTab(id);
@@ -136,15 +168,17 @@ export const Sidebar: React.FC<SidebarProps> = ({ mobileOpen, setMobileOpen }) =
         <div className="flex flex-col overflow-y-auto">
           {/* Logo & Application Title */}
           <div className="flex items-center gap-3 border-b border-[#E5E7EB] p-5">
-            <div className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl text-white shadow-md ${isSuperAdminPortal ? 'bg-purple-700 shadow-purple-700/20' : 'bg-[#D71945] shadow-[#D71945]/20'}`}>
-              <GraduationCap className="h-6 w-6" />
+            <div className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl text-white shadow-md ${isSuperAdminPortal ? 'bg-purple-700 shadow-purple-700/20' : isPrincipalPortal ? 'bg-emerald-700 shadow-emerald-700/20' : 'bg-[#D71945] shadow-[#D71945]/20'}`}>
+              {isPrincipalPortal ? <Landmark className="h-6 w-6" /> : <GraduationCap className="h-6 w-6" />}
             </div>
             <div>
-              <div className={`text-xs font-black tracking-wider uppercase ${isSuperAdminPortal ? 'text-purple-700' : 'text-[#D71945]'}`}>
+              <div className={`text-xs font-black tracking-wider uppercase ${isSuperAdminPortal ? 'text-purple-700' : isPrincipalPortal ? 'text-emerald-700' : 'text-[#D71945]'}`}>
                 MSAJCE
               </div>
               <h1 className="text-sm font-extrabold text-[#111827] leading-tight">
-                {isSuperAdminPortal ? (
+                {isPrincipalPortal ? (
+                  <>Principal<br /><span className="text-[#64748B] font-semibold">Approval Portal</span></>
+                ) : isSuperAdminPortal ? (
                   <>Super Admin<br /><span className="text-[#64748B] font-semibold">Portal &amp; QP Suite</span></>
                 ) : (
                   <>Question Paper<br /><span className="text-[#64748B] font-semibold">Management</span></>
@@ -173,21 +207,25 @@ export const Sidebar: React.FC<SidebarProps> = ({ mobileOpen, setMobileOpen }) =
                         isActive
                           ? isSuperAdminPortal
                             ? 'bg-purple-700 text-white shadow-md shadow-purple-700/25 font-bold'
+                            : isPrincipalPortal
+                            ? 'bg-emerald-700 text-white shadow-md shadow-emerald-700/25 font-bold'
                             : 'bg-[#D71945] text-white shadow-md shadow-[#D71945]/25 font-bold'
                           : highlight
-                          ? 'bg-[#FFF0F3] text-[#D71945] hover:bg-[#FFE0E6]'
+                          ? isPrincipalPortal
+                            ? 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
+                            : 'bg-[#FFF0F3] text-[#D71945] hover:bg-[#FFE0E6]'
                           : 'text-[#111827] hover:bg-[#F7F8FA] hover:text-[#111827]'
                       }`}
                     >
                       <Icon
                         className={`h-4 w-4 shrink-0 transition-transform group-hover:scale-105 ${
-                          isActive ? 'text-white' : highlight ? 'text-[#D71945]' : 'text-[#64748B]'
+                          isActive ? 'text-white' : highlight ? (isPrincipalPortal ? 'text-emerald-700' : 'text-[#D71945]') : 'text-[#64748B]'
                         }`}
                       />
                       <span className="truncate">{item.label}</span>
                       {highlight && !isActive && (
-                        <span className="ml-auto rounded-md bg-[#D71945] px-1.5 py-0.5 text-[9px] font-extrabold text-white">
-                          AUTO
+                        <span className={`ml-auto rounded-md px-1.5 py-0.5 text-[9px] font-extrabold text-white ${isPrincipalPortal ? 'bg-emerald-700' : 'bg-[#D71945]'}`}>
+                          {isPrincipalPortal ? 'REVIEW' : 'AUTO'}
                         </span>
                       )}
                     </button>
@@ -203,7 +241,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ mobileOpen, setMobileOpen }) =
           <div className="flex items-center justify-between rounded-2xl border border-[#E5E7EB] bg-white p-3 shadow-xs">
             <div className="flex items-center gap-2.5 overflow-hidden">
               <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl text-xs font-bold text-white shadow-xs ${
-                isSuperAdminPortal ? 'bg-purple-700' : 'bg-[#111827]'
+                isSuperAdminPortal ? 'bg-purple-700' : isPrincipalPortal ? 'bg-emerald-700' : 'bg-[#111827]'
               }`}>
                 {(currentUser?.name || 'Staff User').split(' ').filter(Boolean).map(n => n[0]).slice(0, 2).join('') || 'U'}
               </div>
@@ -212,7 +250,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ mobileOpen, setMobileOpen }) =
                   {currentUser?.name || 'Staff User'}
                 </p>
                 <span className={`inline-block rounded-md px-1.5 py-0.5 text-[10px] font-bold ${
-                  isSuperAdminPortal ? 'bg-purple-100 text-purple-800' : 'bg-[#FFF8E7] text-[#B45309]'
+                  isSuperAdminPortal ? 'bg-purple-100 text-purple-800' : isPrincipalPortal ? 'bg-emerald-100 text-emerald-800' : 'bg-[#FFF8E7] text-[#B45309]'
                 }`}>
                   {currentUser?.role || 'Exam Cell'}
                 </span>

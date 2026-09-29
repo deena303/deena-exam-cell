@@ -19,7 +19,8 @@ export const Header: React.FC<HeaderProps> = ({ mobileOpen, setMobileOpen }) => 
   const {
     currentUser,
     logout,
-    isSuperAdminPortal
+    isSuperAdminPortal,
+    isPrincipalPortal
   } = useApp();
 
   const [showNotifications, setShowNotifications] = useState(false);
@@ -62,7 +63,7 @@ export const Header: React.FC<HeaderProps> = ({ mobileOpen, setMobileOpen }) => 
             <Menu className="h-5 w-5" />
           </button>
         )}
-        <div className={`flex h-10 w-10 items-center justify-center rounded-xl text-white shadow-sm ${isSuperAdminPortal ? 'bg-purple-700' : 'bg-[#D71945]'}`}>
+        <div className={`flex h-10 w-10 items-center justify-center rounded-xl text-white shadow-sm ${isSuperAdminPortal ? 'bg-purple-700' : isPrincipalPortal ? 'bg-emerald-700' : 'bg-[#D71945]'}`}>
           <GraduationCap className="h-6 w-6" />
         </div>
         <div>
@@ -74,8 +75,8 @@ export const Header: React.FC<HeaderProps> = ({ mobileOpen, setMobileOpen }) => 
               <Shield className="h-3 w-3" /> Autonomous
             </span>
           </div>
-          <div className={`text-[11px] font-semibold tracking-wider uppercase ${isSuperAdminPortal ? 'text-purple-700' : 'text-[#D71945]'}`}>
-            {isSuperAdminPortal ? 'Super Admin Portal' : 'Academic Systems'}
+          <div className={`text-[11px] font-semibold tracking-wider uppercase ${isSuperAdminPortal ? 'text-purple-700' : isPrincipalPortal ? 'text-emerald-700' : 'text-[#D71945]'}`}>
+            {isPrincipalPortal ? 'Principal Portal' : isSuperAdminPortal ? 'Super Admin Portal' : 'Academic Systems'}
           </div>
         </div>
       </div>
@@ -83,7 +84,7 @@ export const Header: React.FC<HeaderProps> = ({ mobileOpen, setMobileOpen }) => 
       {/* Right Controls */}
       <div className="flex items-center gap-3 md:gap-4">
         {/* Academic Year Banner (Exam Cell only) */}
-        {!isSuperAdminPortal && (
+        {!isSuperAdminPortal && !isPrincipalPortal && (
           <div className="hidden lg:flex items-center gap-2 rounded-xl border border-[#E5E7EB] bg-[#F7F8FA] px-3 py-1.5 text-xs text-[#64748B]">
             <Calendar className="h-3.5 w-3.5 text-[#1976D2]" />
             <span>Academic Year:</span>
@@ -96,6 +97,10 @@ export const Header: React.FC<HeaderProps> = ({ mobileOpen, setMobileOpen }) => 
           {isSuperAdminPortal ? (
             <span className="flex items-center gap-1 text-[11px] font-extrabold text-purple-700">
               Super Admin
+            </span>
+          ) : isPrincipalPortal ? (
+            <span className="flex items-center gap-1 text-[11px] font-extrabold text-emerald-700">
+              Principal Portal
             </span>
           ) : (
             <span className="flex items-center gap-1 text-[11px] font-extrabold text-[#B45309]">
@@ -145,7 +150,7 @@ export const Header: React.FC<HeaderProps> = ({ mobileOpen, setMobileOpen }) => 
 
         {/* User Avatar & Logout */}
         <div className="flex items-center gap-2 pl-1 border-l border-[#E5E7EB]">
-          <div className={`flex h-9 w-9 items-center justify-center rounded-xl text-xs font-bold text-white shadow-sm ${isSuperAdminPortal ? 'bg-purple-700' : 'bg-[#111827]'}`}>
+          <div className={`flex h-9 w-9 items-center justify-center rounded-xl text-xs font-bold text-white shadow-sm ${isSuperAdminPortal ? 'bg-purple-700' : isPrincipalPortal ? 'bg-emerald-700' : 'bg-[#111827]'}`}>
             {(currentUser?.name || 'Staff User').split(' ').filter(Boolean).map(n => n[0]).slice(0, 2).join('') || 'U'}
           </div>
           <div className="hidden md:block text-left">

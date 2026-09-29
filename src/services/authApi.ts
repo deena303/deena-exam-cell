@@ -351,6 +351,56 @@ export async function fetchAuditLogs(filters: AuditLogFilters = {}, token: strin
 }
 
 // ============================================================
+// SUBJECT QUESTION COUNTS (Spec §9–§15)
+// ============================================================
+
+export interface SubjectQuestionCountDetail {
+  subjectCode: string;
+  questionCount: number;
+  attributedCount: number;
+  inheritedCount: number;
+  bankCount: number;
+}
+
+export interface SubjectQuestionCountResponse {
+  /** subjectCode -> number of imported questions in scope. */
+  counts: Record<string, number>;
+  detail: Record<string, SubjectQuestionCountDetail>;
+  error: string | null;
+  databaseConfigured: boolean;
+  scope?: { academicYear: string | null; departmentCode: string | null; subjectCount: number };
+}
+
+/**
+ * Fetches REAL question counts from the database, scoped to
+ * Academic Year + Department + Subject Code.
+ *
+ * Throws on failure so the caller can show an explicit error state instead of
+ * silently displaying "0 Questions in Bank" (Spec §15).
+ */
+export async function fetchSubjectQuestionCounts(params: {
+  academicYearId?: string | null;
+  departmentId?: string | null;
+  subjectCodes?: string[] | null;
+  token?: string;
+}): Promise<SubjectQuestionCountResponse> {
+  const q = new URLSearchParams();
+  if (params.academicYearId) q.set('academicYearId', params.academicYearId);
+  if (params.departmentId) q.set('departmentId', params.departmentId);
+  if (params.subjectCodes && params.subjectCodes.length) q.set('subjectCodes', params.subjectCodes.join(','));
+
+  const url = `${API_BASE}/subjects/question-counts${q.toString() ? '?' + q.toString() : ''}`;
+  const res = await fetch(url, {
+    headers: { Accept: 'application/json', ...(params.token ? { Authorization: `Bearer ${params.token}` } : {}) }
+  });
+  const data = await safeJsonParse<any>(res, 'GET /subjects/question-counts');
+  if (!res.ok) {
+    throw new Error(data?.error || 'Unable to load question count.');
+  }
+  return data as SubjectQuestionCountResponse;
+}
+
+// ============================================================
 // PAPER SET STATUS & TRACKING
 // ============================================================
 
@@ -359,14 +409,31 @@ export async function fetchPaperSetStatus(params: {
   academicYearId: string;
   departmentId: string;
   examType: string;
-}): Promise<any> {
+}, token?: string): Promise<any | null> {
+  if (!params.subjectId || !params.academicYearId || !params.departmentId || !params.examType) return null;
   try {
     const p = new URLSearchParams(params as any);
     const res = await fetch(`${API_BASE}/paper-sets/status?${p.toString()}`, {
-      headers: { 'Accept': 'application/json' }
+      headers: {
+        'Accept': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {})
+      }
     });
     if (!res.ok) return null;
     return await safeJsonParse<any>(res, 'GET /paper-sets/status');
+  } catch {
+    return null;
+  }
+}
+
+/** Standard set limits per exam type, straight from the `exam_set_limits` table. */
+export async function fetchPaperSetConfig(token?: string): Promise<any | null> {
+  try {
+    const res = await fetch(`${API_BASE}/paper-sets/config`, {
+      headers: { 'Accept': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) }
+    });
+    if (!res.ok) return null;
+    return await safeJsonParse<any>(res, 'GET /paper-sets/config');
   } catch {
     return null;
   }
@@ -381,20 +448,106 @@ export async function trackPaperSet(params: {
   setDisplayName?: string;
   paperCode?: string;
   localPaperId?: string;
-  additionalSetRequestId?: string;
-}, token: string): Promise<{ success: boolean; tracking?: any; error?: string }> {
+  additionalSetRequestId?: string | null;
+}, token: string): Promise<{ success: boolean; tracking?: any; error?: string; code?: string }> {
   try {
     const res = await fetch(`${API_BASE}/paper-sets/track`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', Authorization: `Bearer ${token}` },
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify(params)
     });
     const data = await safeJsonParse<any>(res, 'POST /paper-sets/track');
-    if (!res.ok) return { success: false, error: data.error || 'Failed to track paper set.' };
+    if (!res.ok) return { success: false, error: data.error || 'Failed to track paper set.', code: data.code };
     return { success: true, tracking: data.tracking };
   } catch (err: any) {
     return { success: false, error: err.message };
   }
+}
+
+/** Persists the generated_papers record (Spec §6) incl. principal_request_id (Spec §18). */
+export async function saveGeneratedPaperRecord(payload: {
+  paperCode: string;
+  subjectId?: string | null;
+  subjectCode?: string | null;
+  subjectName?: string | null;
+  departmentId?: string | null;
+  academicYearId?: string | null;
+  examType: string;
+  setLetter: string;
+  setDisplayName?: string | null;
+  examDate?: string | null;
+  duration?: string | null;
+  maxMarks?: number | null;
+  semester?: string | null;
+  regulation?: string | null;
+  principalRequestId?: string | null;
+  localPaperId?: string | null;
+  /** Spec §18 — which question bank the paper was built from (IAT-only reduced bank). */
+  questionBankSource?: 'ORIGINAL' | 'IAT_GENERATED';
+  iatGeneratedBankId?: string | null;
+  iatGeneratedBankName?: string | null;
+}, token: string): Promise<{ success: boolean; fileName?: string; error?: string; code?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/paper-sets/paper`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(payload)
+    });
+    const data = await safeJsonParse<any>(res, 'POST /paper-sets/paper');
+    if (!res.ok) return { success: false, error: data.error || 'Failed to save paper record.', code: data.code };
+    return { success: true, fileName: data.fileName };
+  } catch (err: any) {
+    return { success: false, error: err.message };
+  }
+}
+
+/**
+ * Records question usage — ONLY after a paper has been reviewed and finalized
+ * (Spec §16). Cancelled or rejected papers never call this.
+ */
+export async function finalizePaperUsage(payload: {
+  paperCode: string;
+  examType: string;
+  questionIds: string[];
+  subjectId?: string | null;
+  /**
+   * Spec §12 / §18 / §29 — which bank the paper was built from. When
+   * 'IAT_GENERATED' the ids are ORIGINAL source question ids, and
+   * `iatGeneratedBankId` records the reduced bank for provenance.
+   */
+  questionBankSource?: 'ORIGINAL' | 'IAT_GENERATED';
+  iatGeneratedBankId?: string | null;
+}, token: string): Promise<{ success: boolean; recorded?: number; error?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/paper-sets/finalize`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(payload)
+    });
+    const data = await safeJsonParse<any>(res, 'POST /paper-sets/finalize');
+    if (!res.ok) return { success: false, error: data.error || 'Failed to record question usage.' };
+    return { success: true, recorded: data.recorded };
+  } catch (err: any) {
+    return { success: false, error: err.message };
+  }
+}
+
+/** Spec §19 — records a "Paper downloaded" audit event. */
+export async function auditPaperDownload(payload: {
+  paperCode?: string | null;
+  examType?: string | null;
+  setLetter?: string | null;
+  subjectCode?: string | null;
+  format?: string | null;
+  fileName?: string | null;
+}, token: string): Promise<void> {
+  try {
+    await fetch(`${API_BASE}/paper-sets/download-audit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(payload)
+    });
+  } catch { /* auditing is best-effort and must never block a download */ }
 }
 
 // ============================================================
@@ -441,7 +594,7 @@ export async function submitPaperRequest(payload: {
 }, token: string): Promise<any> {
   const res = await fetch(`${API_BASE}/paper-requests`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', Authorization: `Bearer ${token}` },
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify(payload)
   });
   const data = await safeJsonParse<any>(res, 'POST /paper-requests');
@@ -449,19 +602,119 @@ export async function submitPaperRequest(payload: {
   return data;
 }
 
+// ============================================================
+// EXAM PATTERNS (Spec §1) — database-backed, editable by the Exam Cell
+// ============================================================
+
+export interface ExamPatternPartAConfig {
+  count: number;
+  marks_per_question: number;
+  total?: number;
+  instruction?: string;
+  question_start?: number;
+  unit_distribution?: string;
+  unit_count?: number;
+  units_per_question?: number;
+}
+
+export interface ExamPatternSectionConfig {
+  name: string;
+  display_questions: number;
+  answer_count: number;
+  unit_pool?: number[];
+  unit_distribution?: string;
+  instruction?: string;
+  marks_per_question?: number;
+}
+
+export interface ExamPatternPartBConfig {
+  format: 'sections' | 'or_choice';
+  marks_per_question: number;
+  total?: number;
+  question_start?: number;
+  sections?: ExamPatternSectionConfig[];
+  or_pairs?: number;
+  unit_map?: Record<string, number>;
+  unit_distribution?: string;
+}
+
+export interface ExamPatternPartCConfig {
+  count: number;
+  marks_per_question: number;
+  total?: number;
+  question_start?: number;
+  or_choice?: boolean;
+  unit_distribution?: string;
+}
+
+export interface ExamPatternConfigRecord {
+  id: string;
+  exam_type: string;
+  exam_name: string;
+  duration: string;
+  max_marks: number;
+  regulation: string | null;
+  show_bl_co_pi: boolean;
+  show_course_obj: boolean;
+  part_a_config: ExamPatternPartAConfig;
+  part_b_config: ExamPatternPartBConfig;
+  part_c_config: ExamPatternPartCConfig | null;
+  instructions: string | null;
+  status: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export async function fetchExamPatterns(token?: string): Promise<ExamPatternConfigRecord[]> {
+  try {
+    const res = await fetch(`${API_BASE}/exam-patterns`, {
+      headers: { 'Accept': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) }
+    });
+    if (!res.ok) return [];
+    const data = await safeJsonParse<any>(res, 'GET /exam-patterns');
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Persists an edited exam pattern (IAT I, IAT II or End Semester).
+ * The backend validates that Part A + Part B (+ Part C) equals Total Marks
+ * and rejects the save when the totals do not match (Spec §1).
+ */
+export async function updateExamPatternConfig(
+  id: string,
+  payload: Partial<Omit<ExamPatternConfigRecord, 'id' | 'exam_type'>>,
+  token: string
+): Promise<ExamPatternConfigRecord> {
+  const res = await fetch(`${API_BASE}/exam-patterns/${id}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify(payload)
+  });
+  const data = await safeJsonParse<any>(res, `PUT /exam-patterns/${id}`);
+  if (!res.ok) {
+    const err: any = new Error(data.error || 'Failed to save exam pattern.');
+    err.breakdown = data.breakdown;
+    err.computedTotal = data.computedTotal;
+    err.declaredTotal = data.declaredTotal;
+    throw err;
+  }
+  return data;
+}
+
 export async function decidePaperRequest(
   id: string,
   payload: {
-    decision: 'approved' | 'partially_approved' | 'rejected';
+    decision: 'approved' | 'rejected';
     remarks?: string;
-    approvedSetCount?: number;
-    approvedSetNames?: string[];
   },
   token: string
 ): Promise<any> {
   const res = await fetch(`${API_BASE}/paper-requests/${id}/decision`, {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', Authorization: `Bearer ${token}` },
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify(payload)
   });
   const data = await safeJsonParse<any>(res, `PUT /paper-requests/${id}/decision`);

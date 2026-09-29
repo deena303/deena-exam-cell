@@ -3,24 +3,19 @@ import {
   FileText,
   Search,
   Eye,
-  Printer,
   CheckCircle2,
-  Clock,
   Sparkles,
-  ChevronRight,
-  Send,
-  AlertCircle,
-  Download,
   FileSpreadsheet,
-  Filter,
   Tag,
-  Calendar,
-  Building2,
-  BookOpen
+  Download,
+  ShieldCheck,
+  FileDown
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { GeneratedPaper, PaperStatus } from '../types';
 import { exportToWordDocument } from '../utils/exportUtils';
+import { paperFileName } from '../utils/paperFileName';
+import { auditPaperDownload } from '../services/authApi';
 
 export const GeneratedPapersListView: React.FC = () => {
   const {
@@ -30,8 +25,9 @@ export const GeneratedPapersListView: React.FC = () => {
     academicYears,
     setActivePaper,
     setActiveTab,
-    updatePaperStatus,
-    currentUser
+    setPaperToReviewId,
+    authToken,
+    showToast
   } = useApp();
 
   // Search and 5 required filters: Academic Year, Department, Subject, Exam Type, Set
@@ -97,7 +93,30 @@ export const GeneratedPapersListView: React.FC = () => {
 
   const handleView = (paper: GeneratedPaper) => {
     setActivePaper(paper);
+    setPaperToReviewId(paper.id);
     setActiveTab('generate-paper');
+  };
+
+  // Spec §5 — Word download uses the canonical Subject Code file name
+  const handleWordDownload = (paper: GeneratedPaper) => {
+    exportToWordDocument(paper);
+    const fileName = paperFileName(paper, 'docx');
+    auditPaperDownload({
+      paperCode: paper.paperCode,
+      examType: paper.examType,
+      setLetter: paper.setLetter,
+      subjectCode: paper.subjectCode,
+      format: 'docx',
+      fileName
+    }, authToken || '');
+    showToast(`Downloaded ${fileName}`);
+  };
+
+  // Spec §5 — PDF is produced from the paper preview (html2canvas → jsPDF)
+  const handlePdfDownload = (paper: GeneratedPaper) => {
+    const fileName = paperFileName(paper, 'pdf');
+    handleView(paper);
+    showToast(`Use "Download PDF" in the preview to save ${fileName}.`);
   };
 
   const handleResetFilters = () => {
@@ -156,6 +175,28 @@ export const GeneratedPapersListView: React.FC = () => {
           >
             Reset Filters
           </button>
+        </div>
+
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div>
+            <button
+              onClick={() => {
+                setPaperToReviewId(null);
+                setActiveTab('generate-paper');
+              }}
+              className="flex items-center gap-2 rounded-xl bg-[#D71945] px-4 py-2.5 text-xs font-extrabold text-white shadow-md shadow-[#D71945]/25 hover:bg-[#c0153c] active:scale-[0.98] transition-all cursor-pointer whitespace-nowrap"
+            >
+              <Sparkles className="h-4 w-4" />
+              <span>Generate New Paper</span>
+            </button>
+            <p className="mt-1.5 text-[10px] text-slate-400">
+              Set limits are enforced on the server — duplicate standard sets cannot be generated from this page.
+            </p>
+          </div>
+
+          <span className="text-[11px] text-slate-400 self-end sm:self-auto">
+            Downloads use the Subject Code file name (e.g. 24CS514_IAT_Set_A.pdf)
+          </span>
         </div>
 
         {/* 5 Dropdowns */}
@@ -247,6 +288,8 @@ export const GeneratedPapersListView: React.FC = () => {
               <option value="B">Set B</option>
               <option value="C">Set C</option>
               <option value="D">Set D</option>
+              <option value="E">Set E (Principal Approved)</option>
+              <option value="F">Set F (Principal Approved)</option>
             </select>
           </div>
         </div>
@@ -329,6 +372,11 @@ export const GeneratedPapersListView: React.FC = () => {
                         <div className="text-[11px] text-slate-400 font-mono mt-0.5">
                           Code: {paper.paperCode} • Max: {paper.maxMarks}M
                         </div>
+                        {paper.principalApprovalRequired && (
+                          <span className="mt-1 inline-flex items-center gap-1 rounded-md bg-purple-100 text-purple-800 px-2 py-0.5 text-[9px] font-bold">
+                            <ShieldCheck className="h-3 w-3" /> Principal Approved
+                          </span>
+                        )}
                       </td>
 
                       {/* Exam Type */}
@@ -361,16 +409,24 @@ export const GeneratedPapersListView: React.FC = () => {
                         </span>
                       </td>
 
-                      {/* Actions */}
+                      {/* Actions — Word, PDF, View / Print (Spec §17) */}
                       <td className="py-3.5 px-4 text-right whitespace-nowrap">
                         <div className="flex items-center justify-end gap-2">
                           <button
-                            onClick={() => exportToWordDocument(paper)}
+                            onClick={() => handleWordDownload(paper)}
                             className="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-white px-2.5 py-1 text-xs font-bold text-slate-700 hover:bg-slate-50 transition-colors cursor-pointer"
-                            title="Download as Microsoft Word (.doc)"
+                            title={`Download ${paperFileName(paper, 'docx')}`}
                           >
                             <FileSpreadsheet className="h-3.5 w-3.5 text-blue-600" />
                             <span>Word</span>
+                          </button>
+                          <button
+                            onClick={() => handlePdfDownload(paper)}
+                            className="inline-flex items-center gap-1 rounded-xl border border-red-200 bg-[#FFF0F3] px-2.5 py-1 text-xs font-bold text-[#D71945] hover:bg-[#FFE0E6] transition-colors cursor-pointer"
+                            title={`Download ${paperFileName(paper, 'pdf')}`}
+                          >
+                            <FileDown className="h-3.5 w-3.5" />
+                            <span>PDF</span>
                           </button>
                           <button
                             onClick={() => handleView(paper)}

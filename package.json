@@ -9,8 +9,10 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "server": "tsx server/index.ts",
-    "dev:server": "tsx watch server/index.ts"
+    "server": "tsx watch server/index.ts",
+    "dev:server": "tsx watch server/index.ts",
+    "test": "tsx server/scripts/testSetLimits.ts",
+    "test:e2e": "tsx server/scripts/testE2E.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

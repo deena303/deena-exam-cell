@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   User,
   Subject,
@@ -16,6 +16,7 @@ import {
   DepartmentRecord,
   SubjectRecord,
   DepartmentScope,
+  QuestionBankSource,
   ACADEMIC_YEARS
 } from '../types';
 import {
@@ -34,8 +35,14 @@ import {
   logoutApi,
   fetchAcademicYears,
   fetchDepartments,
-  fetchSubjects
+  fetchSubjects,
+  fetchExamPatterns,
+  updateExamPatternConfig,
+  finalizePaperUsage,
+  ExamPatternConfigRecord
 } from '../services/authApi';
+import { dbConfigToExamPattern, examPatternToDbPayload } from '../utils/examPatternMapper';
+import { buildPaperFileName } from '../utils/paperFileName';
 
 interface AppContextType {
   // ---- Auth ----
@@ -91,7 +98,11 @@ interface AppContextType {
 
   // ---- Exam patterns ----
   examPatterns: ExamPattern[];
-  updateExamPattern: (id: string, updates: Partial<ExamPattern>) => void;
+  updateExamPattern: (id: string, updates: Partial<ExamPattern>) => Promise<void>;
+  examPatternConfigs: ExamPatternConfigRecord[];
+  examPatternsLoading: boolean;
+  examPatternsLoaded: boolean;
+  refreshExamPatterns: () => Promise<void>;
   ia1Syllabus: UnitSyllabusConfig[];
   setIa1Syllabus: React.Dispatch<React.SetStateAction<UnitSyllabusConfig[]>>;
   ia2Syllabus: UnitSyllabusConfig[];
@@ -101,6 +112,9 @@ interface AppContextType {
   generatedPapers: GeneratedPaper[];
   activePaper: GeneratedPaper | null;
   setActivePaper: (paper: GeneratedPaper | null) => void;
+  /** Set by "View / Print" on the Generated Papers page so the wizard opens the preview (Spec §17) */
+  paperToReviewId: string | null;
+  setPaperToReviewId: (id: string | null) => void;
   generatePaper: (params: {
     subjectCode: string;
     examType: ExamType;
@@ -113,8 +127,27 @@ interface AppContextType {
     scope?: DepartmentScope;
     commonDepartments?: string[];
     departmentIds?: string[];
+    /** Server-assigned set letter from GET /api/paper-sets/status (Spec §4) */
+    setLetter?: string;
+    /** Set name/title override */
+    setDisplayName?: string;
+    /** Spec §18 — approval that permitted an additional set */
+    principalRequestId?: string | null;
+    maxMarks?: number;
+    /** DB-backed question count for the selected year/department/subject (Spec \u00a716) */
+    availableQuestionCount?: number;
+    /**
+     * Spec §18 — when a Generated IAT Question Bank is chosen, the paper is
+     * built ONLY from this pool. IAT-only: ignored for End Semester.
+     */
+    questionPool?: Question[];
+    questionBankSource?: QuestionBankSource;
+    iatGeneratedBankId?: string | null;
+    iatGeneratedBankName?: string | null;
   }) => GeneratedPaper;
   replaceQuestionInPaper: (paperId: string, targetQuestionId: string, newQuestion: Question) => void;
+  /** Removes a paper that was rolled back after a failed set registration (Spec §4) */
+  removePaper: (paperId: string) => void;
   regeneratePaper: (paperId: string) => GeneratedPaper | null;
   updatePaperStatus: (paperId: string, newStatus: PaperStatus, reason?: string) => void;
   deletePaper: (paperId: string) => void;
@@ -340,6 +373,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   });
 
   const [activePaper, setActivePaper] = useState<GeneratedPaper | null>(() => INITIAL_PAPERS[0] || null);
+  const [paperToReviewId, setPaperToReviewId] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   // ============================================================
@@ -377,11 +411,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setAuthSession(session);
       setIsAuthenticated(true);
 
-      // Set active tab based on role
-      if (result.user.role === 'SUPER_ADMIN') {
-        setActiveTab('dashboard');
-      } else {
-        setActiveTab('dashboard');
+      // Spec §7 — route to the correct portal based on the authenticated role.
+      // The portal itself is derived from userRole; each role lands on its
+      // own home tab. Every privileged action is re-verified server-side.
+      switch (result.user.role) {
+        case 'SUPER_ADMIN':
+          setActiveTab('dashboard');
+          break;
+        case 'PRINCIPAL':
+          setActiveTab('dashboard');
+          break;
+        default:
+          setActiveTab('dashboard');
       }
 
       showToast(`Welcome back, ${result.user.name}!`);
@@ -472,11 +513,87 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   // ============================================================
-  // Exam Patterns
+  // Exam Patterns — loaded from Supabase `exam_pattern_configs` (Spec §1)
+  // Falls back to the bundled defaults when the API is unreachable so the
+  // generator keeps working offline.
   // ============================================================
-  const updateExamPattern = (id: string, updates: Partial<ExamPattern>) => {
-    setExamPatterns(prev => prev.map(p => p.id === id ? { ...p, ...updates } : p));
-    showToast('Exam pattern configuration updated.');
+  const [examPatternConfigs, setExamPatternConfigs] = useState<ExamPatternConfigRecord[]>([]);
+  const [examPatternsLoading, setExamPatternsLoading] = useState(false);
+  const [examPatternsLoaded, setExamPatternsLoaded] = useState(false);
+
+  const refreshExamPatterns = useCallback(async () => {
+    setExamPatternsLoading(true);
+    try {
+      const rows = await fetchExamPatterns();
+      if (rows.length > 0) {
+        setExamPatternConfigs(rows);
+        // Keep local state in sync for the paper generator
+        setExamPatterns(prev => {
+          const byType = new Map(rows.map(r => [r.exam_type, r]));
+          const next = prev.map(p => {
+            const row = byType.get(p.examType);
+            return row ? dbConfigToExamPattern(row) : p;
+          });
+          // Add any exam types that exist in the DB but not in local state
+          rows.forEach(r => {
+            if (!next.some(p => p.examType === r.exam_type)) {
+              next.push(dbConfigToExamPattern(r));
+            }
+          });
+          return next;
+        });
+        setExamPatternsLoaded(true);
+      }
+    } catch (err) {
+      console.warn('[AppContext] Failed to load exam patterns:', err);
+    } finally {
+      setExamPatternsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshExamPatterns();
+  }, [refreshExamPatterns]);
+
+  /**
+   * Persists an edited pattern to the database (source of truth) and mirrors
+   * it into local state. The backend re-validates the total marks and rejects
+   * the save when Part A + Part B (+ Part C) does not equal Total Marks.
+   */
+  const updateExamPattern = async (id: string, updates: Partial<ExamPattern>) => {
+    const target = examPatterns.find(p => p.id === id);
+    if (!target) {
+      showToast('Exam pattern not found.');
+      return;
+    }
+    const merged: ExamPattern = { ...target, ...updates };
+    const row = examPatternConfigs.find(r => r.exam_type === merged.examType);
+
+    if (!row) {
+      // No database row — keep the in-memory update (offline mode)
+      setExamPatterns(prev => prev.map(p => (p.id === id ? merged : p)));
+      showToast('Exam pattern updated locally (pattern row not found in database).');
+      return;
+    }
+
+    if (!authSession?.token) {
+      setExamPatterns(prev => prev.map(p => (p.id === id ? merged : p)));
+      showToast('Exam pattern updated locally. Sign in to save it to the database.');
+      return;
+    }
+
+    setExamPatternsLoading(true);
+    try {
+      const payload = examPatternToDbPayload(merged, row);
+      const saved = await updateExamPatternConfig(row.id, payload, authSession.token);
+      setExamPatternConfigs(prev => prev.map(r => (r.id === saved.id ? saved : r)));
+      setExamPatterns(prev => prev.map(p => (p.id === id ? dbConfigToExamPattern(saved) : p)));
+      showToast(`${merged.examType} pattern saved successfully.`);
+    } catch (err: any) {
+      showToast(err?.message || 'Failed to save exam pattern.');
+    } finally {
+      setExamPatternsLoading(false);
+    }
   };
 
   // ============================================================
@@ -496,13 +613,31 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // ============================================================
   // Paper Generation (unchanged logic)
   // ============================================================
+
+  /**
+   * Selected Generated IAT Question Bank pools, keyed by generated bank id.
+   * Spec §29 — "IAT Bank 01" is NOT "Set A". Re-rolling a paper (regeneratePaper)
+   * must keep drawing from the SAME reduced bank, otherwise a re-roll would
+   * silently fall back to the full original bank.
+   */
+  const iatBankPoolsRef = useRef<Map<string, Question[]>>(new Map());
+
   const generatePaper = ({
     subjectCode, examType, examDate, semester, regulation, duration, department, academicYear,
-    scope, commonDepartments, departmentIds
+    scope, commonDepartments, departmentIds, setLetter: setLetterOverride,
+    setDisplayName: setDisplayNameOverride, principalRequestId, maxMarks: maxMarksOverride,
+    availableQuestionCount,
+    questionPool, questionBankSource, iatGeneratedBankId, iatGeneratedBankName
   }: {
     subjectCode: string; examType: ExamType; examDate?: string; semester?: string;
     regulation?: string; duration?: string; department?: string; academicYear?: string;
     scope?: DepartmentScope; commonDepartments?: string[]; departmentIds?: string[];
+    setLetter?: string; setDisplayName?: string; principalRequestId?: string | null; maxMarks?: number;
+    availableQuestionCount?: number;
+    questionPool?: Question[];
+    questionBankSource?: QuestionBankSource;
+    iatGeneratedBankId?: string | null;
+    iatGeneratedBankName?: string | null;
   }): GeneratedPaper => {
     let subject = subjects.find(s => s.code === subjectCode);
     if (!subject) {
@@ -519,17 +654,61 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     const allowedUnits = isIA1 ? [1, 2, 3] : isIA2 ? [3, 4, 5] : [1, 2, 3, 4, 5];
     let currentQuestions = [...questions];
-    let poolForSubject = currentQuestions.filter(q => q.subjectCode === subject!.code);
+
+    // ---------------------------------------------------------------
+    // Spec §18 / §19 / §30 — Generated IAT Question Bank source.
+    //   * IAT I / IAT II may be restricted to a reduced IAT bank.
+    //   * End Semester NEVER uses a reduced bank; the original, full
+    //     question-bank logic is used unchanged.
+    // ---------------------------------------------------------------
+    const useIatBank = !isEndSem && Array.isArray(questionPool) && questionPool.length > 0;
+    const effectiveBankSource: QuestionBankSource = useIatBank ? 'IAT_GENERATED' : 'ORIGINAL';
+    const effectiveIatBankId = useIatBank ? (iatGeneratedBankId ?? null) : null;
+    const effectiveIatBankName = useIatBank ? (iatGeneratedBankName ?? null) : null;
+
+    let poolForSubject: Question[] = useIatBank
+      ? (questionPool as Question[]).slice()
+      : currentQuestions.filter(q => q.subjectCode === subject!.code);
+
+    if (useIatBank && effectiveIatBankId) {
+      iatBankPoolsRef.current.set(effectiveIatBankId, poolForSubject.slice());
+    }
 
     const minRequiredCount = isEndSem ? 22 : 12;
-    const validationIssues: string[] = [];
+    let validationIssues: string[] = [];
     let validationPassed = true;
 
-    if (poolForSubject.length < minRequiredCount) {
+    // Spec §16 — the availability check must use the SAME source the Step 3
+    // card shows. `availableQuestionCount` comes from
+    // GET /api/subjects/question-counts (database). When it is provided it is
+    // authoritative; otherwise we fall back to the locally cached pool.
+    // A selected IAT generated bank IS the authoritative pool, so the check
+    // is done against it directly.
+    const dbAvailable = useIatBank
+      ? poolForSubject.length
+      : (typeof availableQuestionCount === 'number' ? availableQuestionCount : null);
+
+    // Authoritative availability = database count, enriched by any questions
+    // already synced locally for this subject.
+    const effectiveAvailable = dbAvailable !== null
+      ? Math.max(dbAvailable, poolForSubject.length)
+      : poolForSubject.length;
+
+    if (effectiveAvailable < minRequiredCount) {
       validationPassed = false;
       validationIssues.push(
-        `Question Bank has only ${poolForSubject.length} questions for ${subject.code} (minimum required for ${examType}: ${minRequiredCount}). Additional questions were automatically synthesized for blueprint preview.`
+        dbAvailable !== null
+          ? `Question bank contains insufficient questions for ${subject.code}: ${effectiveAvailable} available in the database (minimum required for ${examType}: ${minRequiredCount}).`
+          : `Question Bank has only ${poolForSubject.length} questions for ${subject.code} (minimum required for ${examType}: ${minRequiredCount}). Additional questions were automatically synthesized for blueprint preview.`
       );
+    }
+
+    // Synthesised filler is only acceptable when we have no database count
+    // to trust. With a database count we report the shortfall instead of
+    // silently padding the paper with invented questions.
+    // A selected Generated IAT Question Bank is NEVER padded — its question
+    // set is exactly what the user asked for (Spec §2, §7).
+    if (validationPassed === false && dbAvailable === null && !useIatBank) {
       const synthesized = synthesizeSubjectQuestions(subject);
       const existingTexts = new Set(poolForSubject.map(q => q.questionText.trim().toLowerCase()));
       const toAdd = synthesized.filter(q => !existingTexts.has(q.questionText.trim().toLowerCase()));
@@ -538,6 +717,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setQuestions(currentQuestions);
         setSubjects(prev => prev.map(s => s.code === subject!.code ? { ...s, totalQuestions: s.totalQuestions + toAdd.length } : s));
         poolForSubject = [...toAdd, ...poolForSubject];
+        validationPassed = true;
+        validationIssues = validationIssues.filter(i => !i.includes('synthesized'));
       }
     }
 
@@ -659,8 +840,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     const resolvedAcademicYear = academicYear || subject.academicYear || '2024-2025';
-    const setLetter = getNextSetLetter(subject.code, resolvedAcademicYear, examType);
-    const setDisplayName = `${subject.name} \u2013 Set ${setLetter}`;
+    // Spec §4 — the set letter is allocated by the backend from the database.
+    // The local fallback only applies when the API is unreachable.
+    const setLetter = setLetterOverride || getNextSetLetter(subject.code, resolvedAcademicYear, examType);
+    const setDisplayName = setDisplayNameOverride || `${subject.name} \u2013 Set ${setLetter}`;
 
     const resolvedDept = scope === 'COMMON' ? 'COMMON' : (department || subject.department);
     const deptRecord = activeDepartmentsList.find(d => d.department_code === resolvedDept);
@@ -711,7 +894,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       examDate: examDateVal,
       examMonth,
       duration: duration || (isEndSem ? '3 Hours' : '2 Hours'),
-      maxMarks: isEndSem ? 100 : 60,
+      maxMarks: maxMarksOverride || (isEndSem ? 100 : 60),
       academicYear: resolvedAcademicYear,
       status: 'Draft',
       createdBy: currentUser.name,
@@ -725,7 +908,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       validationPassed,
       validationIssues,
       setLetter,
-      setDisplayName
+      setName: `Set ${setLetter}`,
+      setDisplayName,
+      fileName: buildPaperFileName({ subjectCode: subject.code, examType, setLetter, extension: 'pdf' }),
+      principalRequestId: principalRequestId || null,
+      principalApprovalRequired: Boolean(principalRequestId),
+      principalApprovalStatus: principalRequestId ? 'approved' : 'not_required',
+      generatedBy: currentUser.name,
+      generatedAt: new Date().toISOString(),
+      // Spec §18 / §19 / §29 — records which question bank the paper came
+      // from. End Semester is always 'ORIGINAL'.
+      questionBankSource: effectiveBankSource,
+      iatGeneratedBankId: effectiveIatBankId,
+      iatGeneratedBankName: effectiveIatBankName
     };
 
     setGeneratedPapers(prev => [newPaper, ...prev]);
@@ -762,20 +957,43 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     showToast(`Question replaced with [${newQuestion.id}].`);
   };
 
+  /**
+   * Re-rolls the question selection for an EXISTING paper.
+   * This is NOT a new set — it keeps the same Academic Year / Department /
+   * Subject / Exam Type / Set identity, so it never consumes a set slot and
+   * cannot be used to bypass the generation limit.
+   */
   const regeneratePaper = (paperId: string): GeneratedPaper | null => {
     const target = generatedPapers.find(p => p.id === paperId) || activePaper;
     if (!target) return null;
+    // Spec §29 — a re-roll of a paper built from a Generated IAT Question Bank
+    // must keep using that same reduced bank, never the full original bank.
+    const cachedPool = target.iatGeneratedBankId
+      ? iatBankPoolsRef.current.get(target.iatGeneratedBankId)
+      : undefined;
     const fresh = generatePaper({
       subjectCode: target.subjectCode,
       examType: target.examType,
       examDate: target.examDate,
       semester: target.semester,
       regulation: target.regulation,
-      duration: target.duration
+      duration: target.duration,
+      department: target.department,
+      academicYear: target.academicYear,
+      scope: target.scope,
+      commonDepartments: target.commonDepartments,
+      departmentIds: target.departmentIds,
+      setLetter: target.setLetter,
+      setDisplayName: target.setDisplayName,
+      maxMarks: target.maxMarks,
+      questionPool: cachedPool,
+      questionBankSource: target.questionBankSource,
+      iatGeneratedBankId: target.iatGeneratedBankId,
+      iatGeneratedBankName: target.iatGeneratedBankName
     });
     setGeneratedPapers(prev => [fresh, ...prev.filter(p => p.id !== paperId && p.id !== fresh.id)]);
     setActivePaper(fresh);
-    showToast('New question combination generated.');
+    showToast(`New question combination generated for Set ${target.setLetter || 'A'}.`);
     return fresh;
   };
 
@@ -786,11 +1004,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (newStatus === 'Faculty Reviewed') updated.reviewedBy = currentUser.name;
       else if (newStatus === 'Approved') updated.approvedBy = currentUser.name;
       else if (newStatus === 'Finalized') {
-        const allPaperQIds = [
-          ...paper.partAQuestions.map(q => q.questionId),
-          ...paper.partBQuestions.map(q => q.questionId),
-          ...(paper.partCQuestions ? paper.partCQuestions.map(q => q.questionId) : [])
+        // Spec §16 — question usage is recorded ONLY here: after the paper has
+        // been generated, reviewed and finalized. Cancelled or rejected
+        // papers never reach this branch, so no usage is recorded for them.
+        //
+        // Spec §12 / §29 — when the paper was built from a Generated IAT
+        // Question Bank, usage is recorded against the ORIGINAL source
+        // question id, not against the reduced bank. The reduced bank itself
+        // is a selection, not a new question.
+        const allItems = [
+          ...paper.partAQuestions,
+          ...paper.partBQuestions,
+          ...(paper.partCQuestions || [])
         ];
+        const sourceIdOf = (questionId: string, fallback: Question | undefined) =>
+          fallback?.sourceQuestionId || questionId;
+        const questionById = new Map<string, Question | undefined>();
+        questions.forEach((q) => questionById.set(q.id, q));
+
+        const allPaperQIds = allItems.map((item) => sourceIdOf(item.questionId, questionById.get(item.questionId)));
         const isIA1 = paper.examType === 'Internal Assessment I';
         const isIA2 = paper.examType === 'Internal Assessment II';
         const isEnd = paper.examType === 'End Semester Examination';
@@ -809,6 +1041,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             }
           };
         }));
+
+        // Persist usage + mark the paper Finalized in the database
+        if (authSession?.token) {
+          finalizePaperUsage({
+            paperCode: paper.paperCode,
+            examType: paper.examType,
+            questionIds: Array.from(new Set(allPaperQIds)),
+            questionBankSource: paper.questionBankSource || 'ORIGINAL',
+            iatGeneratedBankId: paper.iatGeneratedBankId || null
+          }, authSession.token).catch(() => {});
+        }
       }
       return updated;
     }));
@@ -822,6 +1065,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setGeneratedPapers(prev => prev.filter(p => p.id !== paperId));
     if (activePaper && activePaper.id === paperId) setActivePaper(null);
     showToast('Paper deleted.');
+  };
+
+  /**
+   * Removes a paper that was created locally but then rejected by the server
+   * (duplicate set / limit reached / invalid approval). Without this a failed
+   * registration would leave a ghost paper in the list that was never
+   * legitimately generated.
+   */
+  const removePaper = (paperId: string) => {
+    setGeneratedPapers(prev => prev.filter(p => p.id !== paperId));
+    if (activePaper && activePaper.id === paperId) setActivePaper(null);
   };
 
   // ============================================================
@@ -896,6 +1150,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         resetQuestionUsage,
         examPatterns,
         updateExamPattern,
+        examPatternConfigs,
+        examPatternsLoading,
+        examPatternsLoaded,
+        refreshExamPatterns,
         ia1Syllabus,
         setIa1Syllabus,
         ia2Syllabus,
@@ -903,9 +1161,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         generatedPapers,
         activePaper,
         setActivePaper,
+        paperToReviewId,
+        setPaperToReviewId,
         generatePaper,
         replaceQuestionInPaper,
         regeneratePaper,
+        removePaper,
         updatePaperStatus,
         deletePaper,
         getNextSetLetter,

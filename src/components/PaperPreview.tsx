@@ -37,6 +37,8 @@ import {
   generatePrintablePaperHtml
 } from '../utils/exportUtils';
 import { computeTableOfSpecification, normalizeBloomsLevel } from '../utils/tosUtils';
+import { paperFileName } from '../utils/paperFileName';
+import { auditPaperDownload } from '../services/authApi';
 
 const INTERNAL_EXAM_WATERMARK_SRC = '/msajce_internal_exam_watermark.png';
 
@@ -53,7 +55,8 @@ export const PaperPreview: React.FC<PaperPreviewProps> = ({ paper, onBack }) => 
     questions,
     currentUser,
     setActiveTab,
-    showToast
+    showToast,
+    authToken
   } = useApp();
 
   // Sheet configuration state
@@ -368,7 +371,16 @@ export const PaperPreview: React.FC<PaperPreviewProps> = ({ paper, onBack }) => 
       setPrintModalOpen(false);
       const sheetIds = sheets.map((s) => `paper-sheet-${s.sheetNumber}`);
       await exportToPdfDirect(paper, sheetIds, (step) => setPdfProgress(step));
-      showToast('PDF question paper downloaded successfully!');
+      // Spec §19 — record the download
+      auditPaperDownload({
+        paperCode: paper.paperCode,
+        examType: paper.examType,
+        setLetter: paper.setLetter,
+        subjectCode: paper.subjectCode,
+        format: 'pdf',
+        fileName: paperFileName(paper, 'pdf')
+      }, authToken || '');
+      showToast(`PDF downloaded: ${paperFileName(paper, 'pdf')}`);
     } catch (err) {
       console.error('PDF direct export error:', err);
       showToast('PDF generation issue encountered. Downloading printable HTML file instead...');
@@ -383,7 +395,16 @@ export const PaperPreview: React.FC<PaperPreviewProps> = ({ paper, onBack }) => 
     setExportMenuOpen(false);
     setPrintModalOpen(false);
     exportToWordDocument(paper);
-    showToast('Word document (.doc) downloaded successfully!');
+    // Spec §19 — record the download
+    auditPaperDownload({
+      paperCode: paper.paperCode,
+      examType: paper.examType,
+      setLetter: paper.setLetter,
+      subjectCode: paper.subjectCode,
+      format: 'docx',
+      fileName: paperFileName(paper, 'docx')
+    }, authToken || '');
+    showToast(`Word document downloaded: ${paperFileName(paper, 'docx')}`);
   };
 
   const handleExportHtml = () => {

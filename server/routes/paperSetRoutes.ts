@@ -1,160 +1,148 @@
 /**
  * Paper Set Control Routes
- * Handles:
- *  - Set limit status checks
- *  - Paper set tracking (writing to DB on generate)
- *  - Additional paper requests (Exam Cell → Principal)
- *  - Principal decisions (approve / reject)
- *  - Paper assignments to Principal for review
- *  - Notifications
+ *
+ * Covers the authoritative generation-permission workflow (Spec §3, §4, §6,
+ * §9–§12, §15, §16, §18, §19, §22):
+ *
+ *  - GET  /api/paper-sets/status    set counts, limit, permission decision
+ *  - POST /api/paper-sets/track     record a generated set (server-side enforcement)
+ *  - POST /api/paper-sets/paper     persist the generated_papers record
+ *  - POST /api/paper-sets/finalize  record question usage (ONLY on finalization)
+ *  - POST /api/paper-sets/download-audit
+ *
+ *  - GET  /api/paper-requests                 list (role filtered)
+ *  - POST /api/paper-requests                 Exam Cell submits a request
+ *  - PUT  /api/paper-requests/:id/decision    Principal approve / reject
+ *  - PUT  /api/paper-requests/:id/cancel      Exam Cell withdraws own request
+ *
+ *  - GET/POST/PUT /api/paper-assignments      Principal paper review
+ *  - GET/PUT  /api/paper-requests/notifications
+ *  - GET      /api/principals
+ *
+ * SECURITY (Spec §22): every limit and approval check happens here, on the
+ * server. The frontend cannot bypass the set limit, forge an approval, reuse a
+ * consumed approval, or approve its own request.
  */
 import express, { Response } from 'express';
 import { requireAuth, requireRole, AuthenticatedRequest } from '../middleware/authMiddleware';
 import { isSupabaseConfigured, getSupabaseClient } from '../services/supabaseQuestionBankService';
+import { writeAuditLog } from '../services/auditService';
+import {
+  resolveExamSetLimit,
+  decideGeneration,
+  isIatExamType,
+  ALL_SET_LETTERS,
+  setGeneratedAuditAction,
+  buildPaperFileName,
+  getFallbackLimit
+} from '../services/examSetLimitService';
+import {
+  authorizeGeneration,
+  consumeApproval,
+  resolveIdentity,
+  suggestNextSetLetter,
+  type GenerationIdentity
+} from '../services/generationAuthorizationService';
 
 const router = express.Router();
 
-// ====================================================================
-// HELPERS
-// ====================================================================
+const VALID_EXAM_TYPES = [
+  'Internal Assessment I',
+  'Internal Assessment II',
+  'End Semester Examination'
+];
 
-const SET_LIMITS: Record<string, number> = {
-  'Internal Assessment I': 2,
-  'Internal Assessment II': 2,
-  'End Semester Examination': 4
-};
-
-const ALL_SET_LETTERS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
-
-function getStandardSetNames(examType: string): string[] {
-  const limit = SET_LIMITS[examType] ?? 2;
-  return ALL_SET_LETTERS.slice(0, limit);
+function isValidExamType(value: any): value is string {
+  return typeof value === 'string' && VALID_EXAM_TYPES.includes(value);
 }
 
-async function insertAuditLog(params: {
-  user_id?: string | null;
-  user_email: string;
-  user_name?: string | null;
-  role: string;
-  action: string;
-  status: string;
-  metadata?: Record<string, any> | null;
-}): Promise<void> {
-  try {
-    if (!isSupabaseConfigured()) return;
-    const client = getSupabaseClient();
-    await client.from('audit_logs').insert({
-      user_id: params.user_id || null,
-      user_email: String(params.user_email).toLowerCase().trim(),
-      user_name: params.user_name || null,
-      role: String(params.role),
-      action: String(params.action).toUpperCase(),
-      status: String(params.status).toUpperCase(),
-      metadata: params.metadata || null,
-      created_at: new Date().toISOString()
-    });
-  } catch (err: any) {
-    console.warn('[audit] paper-set audit log failed:', err?.message);
-  }
-}
-
-async function generateRequestNumber(client: any): Promise<string> {
-  const year = new Date().getFullYear();
-  const { count } = await client
-    .from('additional_paper_requests')
-    .select('*', { count: 'exact', head: true });
-  const seq = ((count ?? 0) + 1).toString().padStart(3, '0');
-  return `APR-${year}-${seq}`;
+function isValidSetLetter(value: any): value is string {
+  return typeof value === 'string' && /^[A-H]$/.test(value.toUpperCase());
 }
 
 // ====================================================================
 // GET /api/paper-sets/status
-// Query current set counts and limit info for a specific combination
+// The single authoritative permission answer. The UI renders this object
+// verbatim so the screen can never disagree with the server (Spec §7).
 // ====================================================================
 router.get('/paper-sets/status', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    if (!isSupabaseConfigured()) {
-      return res.json({ sets: [], count: 0, limit: 2, limitReached: false, nextSetName: 'A', pendingRequest: null });
-    }
-    const client = getSupabaseClient();
     const { subjectId, academicYearId, departmentId, examType } = req.query as Record<string, string>;
 
     if (!subjectId || !academicYearId || !departmentId || !examType) {
       return res.status(400).json({ error: 'subjectId, academicYearId, departmentId, examType are required.' });
     }
-
-    // Get existing sets from tracking table
-    const { data: existingSets, error } = await client
-      .from('paper_set_tracking')
-      .select('set_name, set_display_name, paper_code, created_at, created_by_name')
-      .eq('subject_id', subjectId)
-      .eq('academic_year_id', academicYearId)
-      .eq('department_id', departmentId)
-      .eq('exam_type', examType)
-      .eq('generation_status', 'generated')
-      .order('created_at', { ascending: true });
-
-    if (error) {
-      console.error('[paper-sets] status query error:', error.message);
-      return res.status(500).json({ error: error.message });
+    if (!isValidExamType(examType)) {
+      return res.status(400).json({ error: 'Invalid exam type.' });
     }
 
-    const sets = existingSets || [];
-    const generatedSetNames = sets.map((s: any) => s.set_name);
-    const limit = SET_LIMITS[examType] ?? 2;
-    const standardSetNames = getStandardSetNames(examType);
-    const limitReached = generatedSetNames.length >= limit;
+    const limit = await resolveExamSetLimit(examType);
+    const master = await resolveIdentity({ subjectId, academicYearId, departmentId });
 
-    // Find next available set name (including beyond standard limit)
-    let nextSetName = 'A';
-    for (const letter of ALL_SET_LETTERS) {
-      if (!generatedSetNames.includes(letter)) {
-        nextSetName = letter;
-        break;
-      }
-    }
+    const identity: GenerationIdentity = {
+      subjectId,
+      academicYearId,
+      departmentId,
+      subjectCode: master.subjectCode,
+      academicYear: master.academicYear,
+      departmentCode: master.departmentCode,
+      examType
+    };
 
-    // Check for active (pending/approved/partially_approved) additional paper requests
-    const { data: requests } = await client
-      .from('additional_paper_requests')
-      .select('id, request_number, status, requested_set_names, approved_set_names, approved_set_count, sets_generated_from_this, principal_remarks')
-      .eq('subject_id', subjectId)
-      .eq('academic_year_id', academicYearId)
-      .eq('department_id', departmentId)
-      .eq('exam_type', examType)
-      .in('status', ['pending', 'approved', 'partially_approved'])
-      .order('created_at', { ascending: false })
-      .limit(1);
+    // No explicit set requested -> report the next available one.
+    const authorization = await authorizeGeneration({ identity, requestedSet: null });
 
-    const activeRequest = requests && requests.length > 0 ? requests[0] : null;
-
-    // Determine if there's an unused approval that allows generation
-    let hasValidApproval = false;
-    let approvedSetNamesAvailable: string[] = [];
-    if (activeRequest && (activeRequest.status === 'approved' || activeRequest.status === 'partially_approved')) {
-      const approvedSets: string[] = activeRequest.approved_set_names || [];
-      const generatedFromThis: number = activeRequest.sets_generated_from_this || 0;
-      const approvedCount: number = activeRequest.approved_set_count || approvedSets.length;
-      // Which approved sets have NOT been generated yet?
-      approvedSetNamesAvailable = approvedSets.filter((s: string) => !generatedSetNames.includes(s));
-      hasValidApproval = approvedSetNamesAvailable.length > 0;
+    // Tracking rows, for the "Existing Sets" list
+    let sets: any[] = [];
+    if (isSupabaseConfigured()) {
+      const { data } = await getSupabaseClient()
+        .from('paper_set_tracking')
+        .select('set_name, set_display_name, paper_code, created_at, created_by_name, additional_set_request_id')
+        .eq('subject_id', subjectId)
+        .eq('academic_year_id', academicYearId)
+        .eq('department_id', departmentId)
+        .eq('exam_type', examType)
+        .eq('generation_status', 'generated')
+        .order('created_at', { ascending: true });
+      sets = data || [];
     }
 
     return res.json({
+      // ---- Single source of truth (Spec §7) ----
+      authorization,
+
+      // Retained view-model fields for the existing UI
       sets,
-      count: generatedSetNames.length,
-      generatedSetNames,
-      limit,
-      standardSetNames,
-      limitReached,
-      nextSetName: hasValidApproval ? (approvedSetNamesAvailable[0] || nextSetName) : nextSetName,
-      canGenerate: !limitReached || hasValidApproval,
-      hasValidApproval,
-      approvedSetNamesAvailable,
-      activeRequest,
-      examTypeRule: examType.includes('Internal Assessment')
-        ? `Standard limit: 2 sets (A and B). Additional sets require Principal approval.`
-        : `Standard limit: 4 sets (A, B, C and D). Additional sets require Principal approval.`
+      count: authorization.existingSets.length,
+      generatedSetNames: authorization.existingSets,
+      limit: authorization.limit,
+      standardSetNames: authorization.standardSets,
+      limitReached: authorization.limitReached,
+      nextSetName: authorization.set,
+      canGenerate: authorization.allowed,
+      requiresApproval: authorization.requiresApproval,
+      limitMessage: authorization.limitReached ? authorization.limitMessage : null,
+      hasValidApproval: authorization.code === 'APPROVED',
+      approvedSetNamesAvailable: authorization.code === 'APPROVED' && authorization.set ? [authorization.set] : [],
+      approvalRequest: authorization.approvalId
+        ? {
+          id: authorization.approvalId,
+          status: authorization.approvalStatus,
+          approved_set_names: authorization.set ? [authorization.set] : [],
+          request_number: authorization.approvalRequestNumber
+        }
+        : null,
+      activeRequest: null,
+      pendingRequest: null,
+      reason: authorization.reason,
+      examTypeRule: limit.limitMessage,
+      databaseConfigured: isSupabaseConfigured(),
+      diagnostics: authorization.degradedSchema
+        ? {
+          migration010Applied: false,
+          warning: 'Migration 010 columns are missing on additional_paper_requests. Run supabase/migrations/010_set_tracking_principal_approval.sql. Falling back to sets_generated_from_this for consumption tracking.'
+        }
+        : null
     });
   } catch (err: any) {
     console.error('[paper-sets] status error:', err);
@@ -162,16 +150,14 @@ router.get('/paper-sets/status', requireAuth, async (req: AuthenticatedRequest, 
   }
 });
 
-// ====================================================================
 // POST /api/paper-sets/track
-// Record a generated set. Validates limits server-side before inserting.
+// Records a generated set. Every limit and approval rule is delegated to
+// authorizeGeneration() so this endpoint and the UI can never disagree.
+// Duplicate protection is enforced a second time by the UNIQUE constraint on
+// paper_set_tracking, which makes concurrent double-clicks safe (Spec §5).
 // ====================================================================
 router.post('/paper-sets/track', requireAuth, requireRole('EXAM_CELL', 'SUPER_ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    if (!isSupabaseConfigured()) {
-      return res.json({ success: true, message: 'Tracking skipped (Supabase not configured).' });
-    }
-    const client = getSupabaseClient();
     const {
       subjectId, academicYearId, departmentId, examType,
       setName, setDisplayName, paperCode, localPaperId,
@@ -181,74 +167,78 @@ router.post('/paper-sets/track', requireAuth, requireRole('EXAM_CELL', 'SUPER_AD
     if (!subjectId || !academicYearId || !departmentId || !examType || !setName) {
       return res.status(400).json({ error: 'subjectId, academicYearId, departmentId, examType, setName are required.' });
     }
-
-    const limit = SET_LIMITS[examType] ?? 2;
-
-    // --- Server-side validation: count current generated sets ---
-    const { data: existingSets, error: countErr } = await client
-      .from('paper_set_tracking')
-      .select('set_name')
-      .eq('subject_id', subjectId)
-      .eq('academic_year_id', academicYearId)
-      .eq('department_id', departmentId)
-      .eq('exam_type', examType)
-      .eq('generation_status', 'generated');
-
-    if (countErr) return res.status(500).json({ error: countErr.message });
-
-    const generatedSetNames = (existingSets || []).map((s: any) => s.set_name);
-
-    // Check for duplicate set name
-    if (generatedSetNames.includes(setName)) {
-      return res.status(409).json({ error: `Set ${setName} has already been generated for this subject, year, department, and exam type.` });
+    if (!isValidExamType(examType)) {
+      return res.status(400).json({ error: 'Invalid exam type.' });
+    }
+    if (!isValidSetLetter(setName)) {
+      return res.status(400).json({ error: 'Set name must be a single letter between A and H.' });
     }
 
-    const isStandardSet = getStandardSetNames(examType).includes(setName);
-    const withinLimit = generatedSetNames.length < limit;
+    const normalizedSet = setName.toUpperCase();
 
-    if (!withinLimit && !isStandardSet) {
-      // Additional set — must have valid approval
-      if (!additionalSetRequestId) {
-        return res.status(403).json({ error: 'Standard set limit reached. An approved additional paper request is required.' });
-      }
-
-      // Validate that the approval is real, belongs to this subject/year/dept/exam, and covers this set
-      const { data: approval, error: approvalErr } = await client
-        .from('additional_paper_requests')
-        .select('id, status, approved_set_names, sets_generated_from_this, approved_set_count, subject_id, academic_year_id, department_id, exam_type')
-        .eq('id', additionalSetRequestId)
-        .maybeSingle();
-
-      if (approvalErr || !approval) {
-        return res.status(403).json({ error: 'Invalid or non-existent approval request.' });
-      }
-      if (approval.status !== 'approved' && approval.status !== 'partially_approved') {
-        return res.status(403).json({ error: 'The associated request has not been approved.' });
-      }
-      // Validate it belongs to exact same subject/year/dept/exam
-      if (
-        approval.subject_id !== subjectId ||
-        approval.academic_year_id !== academicYearId ||
-        approval.department_id !== departmentId ||
-        approval.exam_type !== examType
-      ) {
-        return res.status(403).json({ error: 'Approval does not match the current subject, academic year, department, or exam type.' });
-      }
-      // Validate that the requested set name is in the approved list
-      const approvedSets: string[] = approval.approved_set_names || [];
-      if (!approvedSets.includes(setName)) {
-        return res.status(403).json({ error: `Set ${setName} is not in the approved set list.` });
-      }
-      // Validate that not all approved sets have already been generated
-      const alreadyGenerated = generatedSetNames.filter((s: string) => approvedSets.includes(s));
-      if (alreadyGenerated.length >= (approval.approved_set_count || approvedSets.length)) {
-        return res.status(403).json({ error: 'All approved additional sets have already been generated.' });
-      }
-    } else if (!withinLimit) {
-      return res.status(403).json({ error: 'Standard set limit reached. Request and obtain Principal approval before generating additional sets.' });
+    if (!isSupabaseConfigured()) {
+      return res.json({ success: true, message: 'Tracking skipped (Supabase not configured).', databaseConfigured: false });
     }
 
-    // --- Insert tracking record ---
+    const master = await resolveIdentity({ subjectId, academicYearId, departmentId });
+    const identity: GenerationIdentity = {
+      subjectId,
+      academicYearId,
+      departmentId,
+      subjectCode: master.subjectCode,
+      academicYear: master.academicYear,
+      departmentCode: master.departmentCode,
+      examType
+    };
+
+    // ---- Re-check everything inside the operation (Spec §5) ----
+    const authorization = await authorizeGeneration({
+      identity,
+      requestedSet: normalizedSet,
+      userId: req.user!.userId
+    });
+
+    if (!authorization.allowed) {
+      const httpStatus = authorization.code === 'DUPLICATE_SET' ? 409 : 403;
+      writeAuditLog({
+        userId: req.user!.userId,
+        userEmail: req.user!.email,
+        userName: req.user!.name,
+        role: req.user!.role,
+        action: 'PAPER_SET_GENERATION_BLOCKED',
+        status: 'FAILURE',
+        metadata: {
+          academicYearId, departmentId, subjectId, examType,
+          set: normalizedSet,
+          reasonCode: authorization.code
+        }
+      });
+      return res.status(httpStatus).json({
+        // The exact reason — never a generic "blocked" message (Spec §25)
+        error: authorization.reason,
+        code: authorization.code,
+        set: normalizedSet,
+        requiresApproval: authorization.requiresApproval,
+        authorization
+      });
+    }
+
+    // If an approval was used, it must be the one the UI submitted.
+    const approvalIdToConsume = authorization.code === 'APPROVED' ? authorization.approvalId : null;
+    if (approvalIdToConsume && additionalSetRequestId && approvalIdToConsume !== additionalSetRequestId) {
+      return res.status(403).json({
+        error: 'Approval does not match the selected subject set.',
+        code: 'APPROVAL_SCOPE_MISMATCH',
+        set: normalizedSet,
+        requiresApproval: true,
+        authorization
+      });
+    }
+
+    const client = getSupabaseClient();
+
+    // ---- Insert tracking row. The UNIQUE constraint is the atomic guard:
+    //      if two requests race, exactly one insert wins. ----
     const { data: inserted, error: insertErr } = await client
       .from('paper_set_tracking')
       .insert({
@@ -256,12 +246,12 @@ router.post('/paper-sets/track', requireAuth, requireRole('EXAM_CELL', 'SUPER_AD
         department_id: departmentId,
         subject_id: subjectId,
         exam_type: examType,
-        set_name: setName,
+        set_name: normalizedSet,
         set_display_name: setDisplayName || null,
         paper_code: paperCode || null,
         local_paper_id: localPaperId || null,
         generation_status: 'generated',
-        additional_set_request_id: additionalSetRequestId || null,
+        additional_set_request_id: approvalIdToConsume,
         created_by_user_id: req.user!.userId,
         created_by_name: req.user!.name
       })
@@ -270,44 +260,69 @@ router.post('/paper-sets/track', requireAuth, requireRole('EXAM_CELL', 'SUPER_AD
 
     if (insertErr) {
       if (insertErr.code === '23505') {
-        return res.status(409).json({ error: `Set ${setName} already tracked for this combination.` });
+        return res.status(409).json({
+          error: `Set ${normalizedSet} already exists.`,
+          code: 'DUPLICATE_SET',
+          set: normalizedSet
+        });
       }
       return res.status(500).json({ error: insertErr.message });
     }
 
-    // If this came from an additional request, increment sets_generated_from_this
-    if (additionalSetRequestId) {
-      await client
-        .from('additional_paper_requests')
-        .update({ sets_generated_from_this: client.rpc ? undefined : undefined }) // handled below
-        .eq('id', additionalSetRequestId);
+    // ---- Consume the approval atomically (Spec §4) ----
+    if (approvalIdToConsume) {
+      const consumption = await consumeApproval({
+        approvalId: approvalIdToConsume,
+        setLetter: normalizedSet,
+        paperCode
+      });
 
-      // Increment via direct update
-      const { data: reqData } = await client
-        .from('additional_paper_requests')
-        .select('sets_generated_from_this')
-        .eq('id', additionalSetRequestId)
-        .single();
-      if (reqData) {
-        await client
-          .from('additional_paper_requests')
-          .update({ sets_generated_from_this: (reqData.sets_generated_from_this || 0) + 1 })
-          .eq('id', additionalSetRequestId);
+      if (!consumption.consumed) {
+        // Someone else consumed it first. The set row is already written, so we
+        // keep the set (it is legitimately generated exactly once) but report
+        // the race explicitly rather than pretending it was approved cleanly.
+        console.warn(`[paper-sets] approval ${approvalIdToConsume} was already consumed when generating Set ${normalizedSet}`);
+      } else {
+        try {
+          await client.from('paper_request_notifications').insert({
+            recipient_id: req.user!.userId,
+            request_id: approvalIdToConsume,
+            notification_type: 'generated',
+            message: `Set ${normalizedSet} was generated using your Principal approval. The approval is now consumed.`
+          });
+        } catch (notifyErr: any) {
+          console.warn('[paper-sets] notification failed:', notifyErr?.message);
+        }
       }
     }
 
-    // Audit log
-    insertAuditLog({
-      user_id: req.user!.userId,
-      user_email: req.user!.email,
-      user_name: req.user!.name,
+    // ---- Audit (Spec §19) ----
+    writeAuditLog({
+      userId: req.user!.userId,
+      userEmail: req.user!.email,
+      userName: req.user!.name,
       role: req.user!.role,
-      action: additionalSetRequestId ? 'ADDITIONAL_SET_GENERATED' : 'PAPER_SET_GENERATED',
+      action: approvalIdToConsume ? 'ADDITIONAL_PAPER_GENERATED' : setGeneratedAuditAction(examType, normalizedSet),
       status: 'SUCCESS',
-      metadata: { subjectId, examType, setName, paperCode }
+      metadata: {
+        academicYearId,
+        departmentId,
+        subjectId,
+        examType,
+        set: normalizedSet,
+        setName: `Set ${normalizedSet}`,
+        paperCode: paperCode || null,
+        trackingId: inserted.id,
+        principalRequestId: approvalIdToConsume
+      }
     });
 
-    return res.json({ success: true, tracking: inserted });
+    return res.json({
+      success: true,
+      tracking: inserted,
+      authorization: { ...authorization, approvalId: approvalIdToConsume },
+      approvalConsumed: Boolean(approvalIdToConsume)
+    });
   } catch (err: any) {
     console.error('[paper-sets] track error:', err);
     return res.status(500).json({ error: err.message || 'Failed to track paper set.' });
@@ -315,8 +330,248 @@ router.post('/paper-sets/track', requireAuth, requireRole('EXAM_CELL', 'SUPER_AD
 });
 
 // ====================================================================
-// GET /api/paper-requests
-// List additional paper requests (role-filtered)
+// POST /api/paper-sets/paper
+// Persists the generated_papers record (Spec §6) including
+// principal_request_id (Spec §18). Re-validates the set through the same
+// authorizeGeneration() used by the UI, so a paper row can never be written
+// for a set that is not actually permitted.
+// ====================================================================
+router.post('/paper-sets/paper', requireAuth, requireRole('EXAM_CELL', 'SUPER_ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (!isSupabaseConfigured()) {
+      return res.json({ success: true, databaseConfigured: false, message: 'Paper record skipped (Supabase not configured).' });
+    }
+    const client = getSupabaseClient();
+    const {
+      paperCode, subjectId, subjectCode, subjectName, departmentId, academicYearId,
+      examType, setLetter, setDisplayName, examDate, duration, maxMarks,
+      semester, regulation, principalRequestId, localPaperId,
+      questionBankSource, iatGeneratedBankId, iatGeneratedBankName
+    } = req.body;
+
+    if (!paperCode || !examType || !setLetter) {
+      return res.status(400).json({ error: 'paperCode, examType and setLetter are required.' });
+    }
+    if (!isValidExamType(examType)) {
+      return res.status(400).json({ error: 'Invalid exam type.' });
+    }
+    if (!isValidSetLetter(setLetter)) {
+      return res.status(400).json({ error: 'Set name must be a single letter between A and H.' });
+    }
+
+    // Spec §19 / §30 — the reduced-bank link is IAT-only. End Semester keeps
+    // using the original question bank and is never attached to an IAT bank.
+    const bankSource = questionBankSource === 'IAT_GENERATED' ? 'IAT_GENERATED' : 'ORIGINAL';
+    if (bankSource === 'IAT_GENERATED' && examType === 'End Semester Examination') {
+      return res.status(403).json({
+        error: 'A generated IAT question bank cannot be used for an End Semester Examination. End Semester papers always use the original question bank.',
+        code: 'END_SEMESTER_NOT_SUPPORTED'
+      });
+    }
+    const resolvedIatBankId = bankSource === 'IAT_GENERATED' ? (iatGeneratedBankId || null) : null;
+
+    const normalizedSet = setLetter.toUpperCase();
+    let resolvedSubjectCode = subjectCode || '';
+
+    if (subjectId && academicYearId && departmentId) {
+      const master = await resolveIdentity({ subjectId, academicYearId, departmentId });
+      resolvedSubjectCode = subjectCode || master.subjectCode || '';
+      const identity: GenerationIdentity = {
+        subjectId,
+        academicYearId,
+        departmentId,
+        subjectCode: master.subjectCode || subjectCode || '',
+        academicYear: master.academicYear,
+        departmentCode: master.departmentCode,
+        examType
+      };
+      const authorization = await authorizeGeneration({ identity, requestedSet: normalizedSet, userId: req.user!.userId });
+      if (!authorization.allowed) {
+        return res.status(authorization.code === 'DUPLICATE_SET' ? 409 : 403).json({
+          error: authorization.reason,
+          code: authorization.code,
+          set: normalizedSet,
+          requiresApproval: authorization.requiresApproval,
+          authorization
+        });
+      }
+    }
+
+    const limit = await resolveExamSetLimit(examType);
+    const isStandardSet = limit.standardSetNames.includes(normalizedSet);
+    const requiresApproval = !isStandardSet;
+
+    const fileName = buildPaperFileName({
+      subjectCode: resolvedSubjectCode,
+      examType,
+      setLetter: normalizedSet,
+      extension: 'pdf'
+    });
+
+    const { data: inserted, error } = await client
+      .from('generated_papers')
+      .insert({
+        paper_code: paperCode,
+        subject_id: subjectId || null,
+        subject_code: subjectCode || null,
+        subject_name: subjectName || null,
+        department_id: departmentId || null,
+        academic_year_id: academicYearId || null,
+        exam_type: examType,
+        set_letter: normalizedSet,
+        set_name: `Set ${normalizedSet}`,
+        set_display_name: setDisplayName || null,
+        file_name: fileName,
+        exam_date: examDate || null,
+        duration: duration || null,
+        max_marks: maxMarks ?? (examType === 'End Semester Examination' ? 100 : 60),
+        semester: semester ? String(semester) : null,
+        regulation: regulation || null,
+        status: 'Draft',
+        created_by: req.user!.name,
+        generated_by: req.user!.name,
+        generated_by_user_id: req.user!.userId,
+        generated_at: new Date().toISOString(),
+        principal_approval_required: requiresApproval,
+        principal_approval_status: requiresApproval ? (principalRequestId ? 'approved' : 'pending') : 'not_required',
+        principal_request_id: principalRequestId || null,
+        approved_by: principalRequestId ? 'Principal' : null,
+        approved_at: principalRequestId ? new Date().toISOString() : null,
+        question_bank_source: bankSource,
+        iat_generated_bank_id: resolvedIatBankId,
+        iat_generated_bank_name: resolvedIatBankId ? (iatGeneratedBankName || null) : null
+      })
+      .select()
+      .single();
+
+    if (error) {
+      if (error.code === '23505' || error.message?.includes('Duplicate set blocked')) {
+        return res.status(409).json({
+          error: `Set ${normalizedSet} already exists for this Academic Year + Department + Subject + Exam Type.`,
+          code: 'DUPLICATE_SET',
+          set: normalizedSet
+        });
+      }
+      return res.status(500).json({ error: error.message });
+    }
+
+    return res.status(201).json({ success: true, paper: inserted, fileName });
+  } catch (err: any) {
+    console.error('[paper-sets] paper persist error:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ====================================================================
+// POST /api/paper-sets/finalize
+// Records question usage — ONLY after a paper has been reviewed and
+// finalized (Spec §16). Cancelled or rejected papers never reach this.
+// ====================================================================
+router.post('/paper-sets/finalize', requireAuth, requireRole('EXAM_CELL', 'SUPER_ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { paperCode, examType, questionIds, subjectId, questionBankSource, iatGeneratedBankId } = req.body;
+    if (!paperCode || !examType || !Array.isArray(questionIds)) {
+      return res.status(400).json({ error: 'paperCode, examType and questionIds[] are required.' });
+    }
+    if (!isValidExamType(examType)) {
+      return res.status(400).json({ error: 'Invalid exam type.' });
+    }
+
+    // Spec §19 / §30 — End Semester papers can never be attached to a
+    // generated IAT question bank. Reject rather than silently ignore.
+    const bankSource = questionBankSource === 'IAT_GENERATED' ? 'IAT_GENERATED' : 'ORIGINAL';
+    if (bankSource === 'IAT_GENERATED' && examType === 'End Semester Examination') {
+      return res.status(403).json({
+        error: 'A generated IAT question bank cannot be used for an End Semester Examination. End Semester papers always use the original question bank.',
+        code: 'END_SEMESTER_NOT_SUPPORTED'
+      });
+    }
+
+    if (!isSupabaseConfigured()) {
+      return res.json({ success: true, recorded: questionIds.length, databaseConfigured: false });
+    }
+
+    const client = getSupabaseClient();
+    const dbQuestionIds = Array.from(new Set(questionIds.filter((id: any) => typeof id === 'string' && id.trim())));
+
+    let recorded = 0;
+    if (dbQuestionIds.length > 0) {
+      const rows = dbQuestionIds.map((questionId: string) => ({
+        question_id: questionId,
+        exam_type: examType,
+        paper_code: paperCode,
+        // Spec §12 — provenance of the usage record. `question_id` always
+        // points at the ORIGINAL question in the `questions` table.
+        question_bank_source: bankSource,
+        iat_generated_bank_id: bankSource === 'IAT_GENERATED' ? (iatGeneratedBankId || null) : null,
+        used_at: new Date().toISOString()
+      }));
+      const { error } = await client.from('question_usage_history').insert(rows);
+      if (error) {
+        console.warn('[paper-sets] usage history insert failed:', error.message);
+      } else {
+        recorded = rows.length;
+      }
+    }
+
+    await client
+      .from('generated_papers')
+      .update({
+        status: 'Finalized',
+        question_bank_source: bankSource,
+        iat_generated_bank_id: bankSource === 'IAT_GENERATED' ? (iatGeneratedBankId || null) : null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('paper_code', paperCode);
+
+    writeAuditLog({
+      userId: req.user!.userId,
+      userEmail: req.user!.email,
+      userName: req.user!.name,
+      role: req.user!.role,
+      action: 'PAPER_FINALIZED',
+      status: 'SUCCESS',
+      metadata: {
+        paperCode,
+        examType,
+        subjectId: subjectId || null,
+        questionUsageRecorded: recorded,
+        questionBankSource: bankSource,
+        generatedBankId: bankSource === 'IAT_GENERATED' ? (iatGeneratedBankId || null) : null
+      }
+    });
+
+    return res.json({ success: true, recorded });
+  } catch (err: any) {
+    console.error('[paper-sets] finalize error:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ====================================================================
+// POST /api/paper-sets/download-audit  (Spec §19)
+// ====================================================================
+router.post('/paper-sets/download-audit', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { paperCode, examType, setLetter, format, fileName, subjectCode } = req.body;
+    writeAuditLog({
+      userId: req.user!.userId,
+      userEmail: req.user!.email,
+      userName: req.user!.name,
+      role: req.user!.role,
+      action: 'PAPER_DOWNLOADED',
+      status: 'SUCCESS',
+      metadata: { paperCode: paperCode || null, examType: examType || null, set: setLetter || null, format: format || null, fileName: fileName || null, subjectCode: subjectCode || null }
+    });
+    return res.json({ success: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ====================================================================
+// GET /api/paper-requests — role filtered list
 // ====================================================================
 router.get('/paper-requests', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -333,12 +588,11 @@ router.get('/paper-requests', requireAuth, async (req: AuthenticatedRequest, res
       `)
       .order('created_at', { ascending: false });
 
-    // Exam Cell only sees their own requests; Principal/Super Admin sees all
+    // Exam Cell only sees their own requests; Principal/Super Admin see all
     if (req.user!.role === 'EXAM_CELL') {
       query = query.eq('requested_by_user_id', req.user!.userId);
     }
 
-    // Filters from query params
     const { status, subjectId, academicYearId, departmentId, examType } = req.query as Record<string, string>;
     if (status) query = query.eq('status', status);
     if (subjectId) query = query.eq('subject_id', subjectId);
@@ -355,8 +609,7 @@ router.get('/paper-requests', requireAuth, async (req: AuthenticatedRequest, res
 });
 
 // ====================================================================
-// POST /api/paper-requests
-// Exam Cell submits a new additional paper request
+// POST /api/paper-requests — Exam Cell requests an additional set
 // ====================================================================
 router.post('/paper-requests', requireAuth, requireRole('EXAM_CELL', 'SUPER_ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -374,11 +627,50 @@ router.post('/paper-requests', requireAuth, requireRole('EXAM_CELL', 'SUPER_ADMI
     if (!academicYearId || !departmentId || !subjectId || !examType || !reason) {
       return res.status(400).json({ error: 'academicYearId, departmentId, subjectId, examType, reason are required.' });
     }
+    if (!isValidExamType(examType)) {
+      return res.status(400).json({ error: 'Invalid exam type.' });
+    }
+    if (!String(reason).trim()) {
+      return res.status(400).json({ error: 'A reason for the additional paper is required.' });
+    }
 
-    // Check for existing pending request for same combination
+    const sets: string[] = Array.isArray(requestedSetNames)
+      ? requestedSetNames.map((s: any) => String(s).toUpperCase()).filter(isValidSetLetter)
+      : [];
+    if (sets.length === 0) {
+      return res.status(400).json({ error: 'requestedSetNames must contain the specific set being requested (e.g. ["C"]).' });
+    }
+    if (sets.length > 1) {
+      // Spec §12 — every additional set needs its own approval
+      return res.status(400).json({ error: 'Only one additional set may be requested at a time. Each additional set requires its own Principal approval.' });
+    }
+
+    // Only allow a request when the standard limit is genuinely reached
+    const limit = await resolveExamSetLimit(examType);
     const { data: existing } = await client
+      .from('paper_set_tracking')
+      .select('set_name')
+      .eq('subject_id', subjectId)
+      .eq('academic_year_id', academicYearId)
+      .eq('department_id', departmentId)
+      .eq('exam_type', examType)
+      .eq('generation_status', 'generated');
+
+    const generatedSetNames: string[] = (existing || []).map((s: any) => s.set_name);
+    if (generatedSetNames.length < limit.maxSets) {
+      return res.status(409).json({
+        error: `The standard set limit for this examination has not been reached yet (${generatedSetNames.length}/${limit.maxSets}). Generate Set ${limit.standardSetNames.find(l => !generatedSetNames.includes(l))} directly instead.`,
+        code: 'LIMIT_NOT_REACHED'
+      });
+    }
+    if (generatedSetNames.includes(sets[0])) {
+      return res.status(409).json({ error: `Set ${sets[0]} already exists.`, code: 'DUPLICATE_SET' });
+    }
+
+    // Block duplicate pending request
+    const { data: pending } = await client
       .from('additional_paper_requests')
-      .select('id, status')
+      .select('id, request_number')
       .eq('subject_id', subjectId)
       .eq('academic_year_id', academicYearId)
       .eq('department_id', departmentId)
@@ -386,8 +678,25 @@ router.post('/paper-requests', requireAuth, requireRole('EXAM_CELL', 'SUPER_ADMI
       .eq('status', 'pending')
       .limit(1);
 
-    if (existing && existing.length > 0) {
-      return res.status(409).json({ error: 'A pending request already exists for this subject and examination. Wait for the Principal\'s decision before submitting a new request.' });
+    if (pending && pending.length > 0) {
+      return res.status(409).json({
+        error: `Request ${pending[0].request_number} is already pending the Principal's decision. Wait for a decision before submitting a new request.`,
+        code: 'PENDING_REQUEST_EXISTS'
+      });
+    }
+
+    // Block reuse of an already-consumed approval for the same set
+    const { data: consumed } = await client
+      .from('additional_paper_requests')
+      .select('id, request_number, consumed_set_name')
+      .eq('subject_id', subjectId)
+      .eq('academic_year_id', academicYearId)
+      .eq('department_id', departmentId)
+      .eq('exam_type', examType)
+      .eq('consumed', true);
+
+    if (consumed && consumed.some((c: any) => c.consumed_set_name === sets[0])) {
+      return res.status(409).json({ error: `Set ${sets[0]} was already generated using a previous approval.`, code: 'SET_ALREADY_GENERATED' });
     }
 
     const requestNumber = await generateRequestNumber(client);
@@ -400,22 +709,23 @@ router.post('/paper-requests', requireAuth, requireRole('EXAM_CELL', 'SUPER_ADMI
         department_id: departmentId,
         subject_id: subjectId,
         exam_type: examType,
-        existing_set_count: existingSetCount || 0,
-        existing_set_names: existingSetNames || [],
-        requested_set_count: requestedSetCount || 1,
-        requested_set_names: requestedSetNames || [],
-        reason,
+        existing_set_count: generatedSetNames.length,
+        existing_set_names: generatedSetNames,
+        requested_set_count: 1,
+        requested_set_names: sets,
+        reason: String(reason).trim(),
         supporting_document_path: supportingDocumentPath || null,
         requested_by_user_id: req.user!.userId,
         requested_by_name: req.user!.name,
-        status: 'pending'
+        status: 'pending',
+        consumed: false
       })
       .select()
       .single();
 
     if (error) return res.status(500).json({ error: error.message });
 
-    // Notify all Principal accounts
+    // Notify every active Principal
     const { data: principals } = await client
       .from('user_accounts')
       .select('id')
@@ -423,34 +733,44 @@ router.post('/paper-requests', requireAuth, requireRole('EXAM_CELL', 'SUPER_ADMI
       .eq('status', 'active');
 
     if (principals && principals.length > 0) {
-      const notifications = principals.map((p: any) => ({
-        recipient_id: p.id,
-        request_id: inserted.id,
-        notification_type: 'submitted',
-        message: `New additional paper request ${requestNumber} submitted by ${req.user!.name} for ${examType}.`
-      }));
-      await client.from('paper_request_notifications').insert(notifications);
+      await client.from('paper_request_notifications').insert(
+        principals.map((p: any) => ({
+          recipient_id: p.id,
+          request_id: inserted.id,
+          notification_type: 'submitted',
+          message: `New additional paper request ${requestNumber} for Set ${sets[0]} (${examType}) submitted by ${req.user!.name}.`
+        }))
+      );
     }
 
-    insertAuditLog({
-      user_id: req.user!.userId,
-      user_email: req.user!.email,
-      user_name: req.user!.name,
+    writeAuditLog({
+      userId: req.user!.userId,
+      userEmail: req.user!.email,
+      userName: req.user!.name,
       role: req.user!.role,
-      action: 'ADDITIONAL_PAPER_REQUEST_SUBMITTED',
+      action: 'ADDITIONAL_PAPER_REQUEST_CREATED',
       status: 'SUCCESS',
-      metadata: { requestId: inserted.id, requestNumber, subjectId, examType }
+      metadata: {
+        requestId: inserted.id,
+        requestNumber,
+        academicYearId,
+        departmentId,
+        subjectId,
+        examType,
+        set: sets[0],
+        existingSets: generatedSetNames
+      }
     });
 
     return res.status(201).json(inserted);
   } catch (err: any) {
+    console.error('[paper-requests] create error:', err);
     return res.status(500).json({ error: err.message });
   }
 });
 
 // ====================================================================
-// PUT /api/paper-requests/:id/decision
-// Principal approves, partially approves, or rejects a request
+// PUT /api/paper-requests/:id/decision — Principal APPROVE or REJECT
 // ====================================================================
 router.put('/paper-requests/:id/decision', requireAuth, requireRole('PRINCIPAL', 'SUPER_ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -459,20 +779,18 @@ router.put('/paper-requests/:id/decision', requireAuth, requireRole('PRINCIPAL',
     }
     const client = getSupabaseClient();
     const { id } = req.params;
-    const { decision, remarks, approvedSetCount, approvedSetNames } = req.body;
+    const { decision, remarks } = req.body;
 
-    if (!decision || !['approved', 'partially_approved', 'rejected'].includes(decision)) {
-      return res.status(400).json({ error: 'decision must be approved, partially_approved, or rejected.' });
+    if (!decision || !['approved', 'rejected'].includes(decision)) {
+      return res.status(400).json({ error: 'decision must be approved or rejected.' });
+    }
+    if (decision === 'rejected' && !String(remarks || '').trim()) {
+      return res.status(400).json({ error: 'A rejection reason is mandatory.' });
     }
 
-    if ((decision === 'rejected' || decision === 'partially_approved') && !remarks) {
-      return res.status(400).json({ error: 'Remarks are mandatory when rejecting or partially approving a request.' });
-    }
-
-    // Fetch the request to validate it's pending
     const { data: request, error: fetchErr } = await client
       .from('additional_paper_requests')
-      .select('*, subjects(subject_code, subject_name), requested_by_user_id, requested_by_name')
+      .select('*')
       .eq('id', id)
       .maybeSingle();
 
@@ -483,80 +801,118 @@ router.put('/paper-requests/:id/decision', requireAuth, requireRole('PRINCIPAL',
       return res.status(409).json({ error: `Request is already in status: ${request.status}. Only pending requests can receive a decision.` });
     }
 
+    // ---- Spec §22: no self-approval ----
+    if (request.requested_by_user_id === req.user!.userId) {
+      writeAuditLog({
+        userId: req.user!.userId,
+        userEmail: req.user!.email,
+        userName: req.user!.name,
+        role: req.user!.role,
+        action: 'REQUEST_SELF_APPROVAL_BLOCKED',
+        status: 'FAILURE',
+        metadata: { requestId: id }
+      });
+      return res.status(403).json({ error: 'You cannot approve or reject a request that you submitted yourself.', code: 'SELF_APPROVAL' });
+    }
+
+    const now = new Date().toISOString();
     const updatePayload: Record<string, any> = {
       status: decision,
       principal_decision_by_id: req.user!.userId,
       principal_decision_by_name: req.user!.name,
-      principal_decision_at: new Date().toISOString(),
-      principal_remarks: remarks || null
+      principal_decision_at: now,
+      principal_remarks: remarks ? String(remarks).trim() : null,
+      updated_at: now
     };
 
     if (decision === 'approved') {
-      updatePayload.approved_set_count = request.requested_set_count;
-      updatePayload.approved_set_names = request.requested_set_names;
-    } else if (decision === 'partially_approved') {
-      if (!approvedSetCount || !approvedSetNames || approvedSetNames.length === 0) {
-        return res.status(400).json({ error: 'approvedSetCount and approvedSetNames are required for partial approval.' });
-      }
-      updatePayload.approved_set_count = approvedSetCount;
-      updatePayload.approved_set_names = approvedSetNames;
+      // Approval is bound to exactly the requested set (Spec §12)
+      const requestedSets: string[] = request.requested_set_names || [];
+      updatePayload.approved_set_count = 1;
+      updatePayload.approved_set_names = requestedSets;
+      updatePayload.consumed = false;
+      updatePayload.consumed_at = null;
+      updatePayload.consumed_set_name = null;
+    } else {
+      // Spec §11 — store rejection audit trail
+      updatePayload.rejected_by_id = req.user!.userId;
+      updatePayload.rejected_by_name = req.user!.name;
+      updatePayload.rejected_at = now;
+      updatePayload.rejection_reason = String(remarks).trim();
+      updatePayload.approved_set_count = 0;
+      updatePayload.approved_set_names = [];
     }
 
+    // Only a Principal / Super Admin can move the status — enforced by requireRole above
     const { data: updated, error: updateErr } = await client
       .from('additional_paper_requests')
       .update(updatePayload)
       .eq('id', id)
+      .eq('status', 'pending') // optimistic guard: never double-decide
       .select()
       .single();
 
     if (updateErr) return res.status(500).json({ error: updateErr.message });
+    if (!updated) return res.status(409).json({ error: 'Request was already decided by another user.' });
 
-    // Notify the Exam Cell user who submitted the request
+    // Notify the requesting Exam Cell user
     await client.from('paper_request_notifications').insert({
       recipient_id: request.requested_by_user_id,
       request_id: id,
       notification_type: decision,
-      message: `Your request ${request.request_number} has been ${decision.replace('_', ' ')} by ${req.user!.name}. ${remarks ? 'Remarks: ' + remarks : ''}`
+      message: decision === 'approved'
+        ? `Your request ${request.request_number} has been APPROVED by ${req.user!.name}. You may now generate the approved set.`
+        : `Your request ${request.request_number} has been REJECTED by ${req.user!.name}. Reason: ${String(remarks).trim()}`
     });
 
-    insertAuditLog({
-      user_id: req.user!.userId,
-      user_email: req.user!.email,
-      user_name: req.user!.name,
+    writeAuditLog({
+      userId: req.user!.userId,
+      userEmail: req.user!.email,
+      userName: req.user!.name,
       role: req.user!.role,
-      action: `REQUEST_${decision.toUpperCase()}`,
+      action: decision === 'approved' ? 'PRINCIPAL_APPROVED_REQUEST' : 'PRINCIPAL_REJECTED_REQUEST',
       status: 'SUCCESS',
-      metadata: { requestId: id, decision, approvedSetNames, remarks }
+      metadata: {
+        requestId: id,
+        requestNumber: request.request_number,
+        academicYearId: request.academic_year_id,
+        departmentId: request.department_id,
+        subjectId: request.subject_id,
+        examType: request.exam_type,
+        set: (request.requested_set_names || []).join(','),
+        decision,
+        remarks: remarks || null
+      }
     });
 
     return res.json(updated);
   } catch (err: any) {
+    console.error('[paper-requests] decision error:', err);
     return res.status(500).json({ error: err.message });
   }
 });
 
 // ====================================================================
 // PUT /api/paper-requests/:id/cancel
-// Exam Cell cancels their own pending request
 // ====================================================================
 router.put('/paper-requests/:id/cancel', requireAuth, requireRole('EXAM_CELL'), async (req: AuthenticatedRequest, res: Response) => {
   try {
     if (!isSupabaseConfigured()) return res.status(503).json({ error: 'Database not configured.' });
     const client = getSupabaseClient();
 
-    const { data: req2 } = await client
+    const { data: existing } = await client
       .from('additional_paper_requests')
       .select('status, requested_by_user_id')
       .eq('id', req.params.id)
       .maybeSingle();
 
-    if (!req2) return res.status(404).json({ error: 'Request not found.' });
-    if (req2.requested_by_user_id !== req.user!.userId) return res.status(403).json({ error: 'You can only cancel your own requests.' });
-    if (req2.status !== 'pending') return res.status(409).json({ error: 'Only pending requests can be cancelled.' });
+    if (!existing) return res.status(404).json({ error: 'Request not found.' });
+    if (existing.requested_by_user_id !== req.user!.userId) return res.status(403).json({ error: 'You can only cancel your own requests.' });
+    if (existing.status !== 'pending') return res.status(409).json({ error: 'Only pending requests can be cancelled.' });
 
     const { data: updated, error } = await client
       .from('additional_paper_requests')
-      .update({ status: 'cancelled' })
+      .update({ status: 'cancelled', updated_at: new Date().toISOString() })
       .eq('id', req.params.id)
       .select()
       .single();
@@ -570,7 +926,6 @@ router.put('/paper-requests/:id/cancel', requireAuth, requireRole('EXAM_CELL'), 
 
 // ====================================================================
 // GET /api/paper-assignments
-// Principal sees papers assigned to them; Exam Cell sees papers they assigned
 // ====================================================================
 router.get('/paper-assignments', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -587,7 +942,6 @@ router.get('/paper-assignments', requireAuth, async (req: AuthenticatedRequest, 
     } else if (req.user!.role === 'EXAM_CELL') {
       query = query.eq('assigned_by_user_id', req.user!.userId);
     }
-    // SUPER_ADMIN sees all
 
     const { reviewStatus } = req.query as Record<string, string>;
     if (reviewStatus) query = query.eq('review_status', reviewStatus);
@@ -602,7 +956,6 @@ router.get('/paper-assignments', requireAuth, async (req: AuthenticatedRequest, 
 
 // ====================================================================
 // POST /api/paper-assignments
-// Exam Cell assigns a paper to the Principal
 // ====================================================================
 router.post('/paper-assignments', requireAuth, requireRole('EXAM_CELL', 'SUPER_ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -619,7 +972,6 @@ router.post('/paper-assignments', requireAuth, requireRole('EXAM_CELL', 'SUPER_A
       return res.status(400).json({ error: 'paperCode, localPaperId, subjectCode, examType, assignedPrincipalId are required.' });
     }
 
-    // Get Principal name
     const { data: principal } = await client
       .from('user_accounts')
       .select('name, role')
@@ -653,14 +1005,25 @@ router.post('/paper-assignments', requireAuth, requireRole('EXAM_CELL', 'SUPER_A
 
     if (error) return res.status(500).json({ error: error.message });
 
-    insertAuditLog({
-      user_id: req.user!.userId,
-      user_email: req.user!.email,
-      user_name: req.user!.name,
+    try {
+      await client.from('paper_request_notifications').insert({
+        recipient_id: assignedPrincipalId,
+        request_id: inserted.id,
+        notification_type: 'submitted',
+        message: `Paper ${paperCode} (${subjectCode}) was assigned to you for review.`
+      });
+    } catch (notifyErr: any) {
+      console.warn('[paper-assignments] notification failed:', notifyErr?.message);
+    }
+
+    writeAuditLog({
+      userId: req.user!.userId,
+      userEmail: req.user!.email,
+      userName: req.user!.name,
       role: req.user!.role,
       action: 'PAPER_ASSIGNED_TO_PRINCIPAL',
       status: 'SUCCESS',
-      metadata: { assignmentId: inserted.id, paperCode, subjectCode, examType, setName }
+      metadata: { assignmentId: inserted.id, paperCode, subjectCode, examType, set: setName || null }
     });
 
     return res.status(201).json(inserted);
@@ -671,7 +1034,6 @@ router.post('/paper-assignments', requireAuth, requireRole('EXAM_CELL', 'SUPER_A
 
 // ====================================================================
 // PUT /api/paper-assignments/:id/review
-// Principal marks a paper as reviewed
 // ====================================================================
 router.put('/paper-assignments/:id/review', requireAuth, requireRole('PRINCIPAL', 'SUPER_ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -683,7 +1045,6 @@ router.put('/paper-assignments/:id/review', requireAuth, requireRole('PRINCIPAL'
       return res.status(400).json({ error: 'reviewStatus must be reviewed or returned.' });
     }
 
-    // Verify this assignment belongs to this Principal
     const { data: assignment } = await client
       .from('principal_paper_assignments')
       .select('assigned_principal_id, paper_code')
@@ -708,10 +1069,10 @@ router.put('/paper-assignments/:id/review', requireAuth, requireRole('PRINCIPAL'
 
     if (error) return res.status(500).json({ error: error.message });
 
-    insertAuditLog({
-      user_id: req.user!.userId,
-      user_email: req.user!.email,
-      user_name: req.user!.name,
+    writeAuditLog({
+      userId: req.user!.userId,
+      userEmail: req.user!.email,
+      userName: req.user!.name,
       role: req.user!.role,
       action: 'PAPER_REVIEWED_BY_PRINCIPAL',
       status: 'SUCCESS',
@@ -725,8 +1086,7 @@ router.put('/paper-assignments/:id/review', requireAuth, requireRole('PRINCIPAL'
 });
 
 // ====================================================================
-// GET /api/paper-requests/notifications
-// Get unread notifications for the logged-in user
+// Notifications
 // ====================================================================
 router.get('/paper-requests/notifications', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -745,7 +1105,6 @@ router.get('/paper-requests/notifications', requireAuth, async (req: Authenticat
   }
 });
 
-// Mark notifications as read
 router.put('/paper-requests/notifications/mark-read', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
     if (!isSupabaseConfigured()) return res.json({ success: true });
@@ -762,9 +1121,9 @@ router.put('/paper-requests/notifications/mark-read', requireAuth, async (req: A
 });
 
 // ====================================================================
-// GET /api/principals — list all active Principal accounts
+// GET /api/principals
 // ====================================================================
-router.get('/principals', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+router.get('/principals', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
   try {
     if (!isSupabaseConfigured()) return res.json([]);
     const client = getSupabaseClient();
@@ -780,4 +1139,39 @@ router.get('/principals', requireAuth, async (req: AuthenticatedRequest, res: Re
   }
 });
 
+// ====================================================================
+// GET /api/paper-sets/config — exposes the limit table to the frontend
+// ====================================================================
+router.get('/paper-sets/config', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const examTypes = VALID_EXAM_TYPES;
+    const limits = await Promise.all(examTypes.map((t) => resolveExamSetLimit(t)));
+    return res.json({
+      setLetters: ALL_SET_LETTERS,
+      limits: limits.map((l) => ({
+        examType: l.examType,
+        maxSets: l.maxSets,
+        standardSetNames: l.standardSetNames,
+        limitMessage: l.limitMessage,
+        isIAT: isIatExamType(l.examType)
+      }))
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+export { getFallbackLimit };
 export default router;
+
+// ====================================================================
+// Helpers
+// ====================================================================
+async function generateRequestNumber(client: any): Promise<string> {
+  const year = new Date().getFullYear();
+  const { count } = await client
+    .from('additional_paper_requests')
+    .select('*', { count: 'exact', head: true });
+  const seq = ((count ?? 0) + 1).toString().padStart(3, '0');
+  return `APR-${year}-${seq}`;
+}
