@@ -46,7 +46,8 @@ import {
 import {
   extractQuestionBank,
   approveQuestionBank,
-  checkBackendHealth
+  checkBackendHealth,
+  geminiStatusMessage
 } from '../services/questionBankApi';
 import { SideBySideReviewModal } from './SideBySideReviewModal';
 
@@ -170,9 +171,17 @@ export const ImportQuestionBankView: React.FC = () => {
     checked: boolean;
     running: boolean;
     geminiConfigured: boolean;
+    geminiAuthenticated: boolean;
+    geminiModelAvailable: boolean;
     geminiStatus?: string;
     geminiMessage?: string;
-  }>({ checked: false, running: false, geminiConfigured: false });
+  }>({
+    checked: false,
+    running: false,
+    geminiConfigured: false,
+    geminiAuthenticated: false,
+    geminiModelAvailable: false
+  });
 
   // Subject mismatch state
   const [subjectMismatch, setSubjectMismatch] = useState<string | null>(null);
@@ -187,6 +196,8 @@ export const ImportQuestionBankView: React.FC = () => {
         checked: true,
         running: status.running,
         geminiConfigured: status.geminiConfigured,
+        geminiAuthenticated: status.geminiAuthenticated,
+        geminiModelAvailable: status.geminiModelAvailable,
         geminiStatus: status.geminiStatus,
         geminiMessage: status.geminiMessage
       });
@@ -765,11 +776,25 @@ export const ImportQuestionBankView: React.FC = () => {
         </div>
       )}
 
-      {backendStatus.checked && backendStatus.running && backendStatus.geminiConfigured && (
+      {backendStatus.checked && backendStatus.running && backendStatus.geminiConfigured && !backendStatus.geminiModelAvailable && (
+        <div className="rounded-2xl border border-rose-200 bg-rose-50 p-4 flex items-start gap-3">
+          <AlertCircle className="h-5 w-5 text-rose-600 shrink-0 mt-0.5" />
+          <div>
+            <p className="text-xs font-black text-rose-900">
+              Gemini Unavailable ({backendStatus.geminiStatus || 'unknown'})
+            </p>
+            <p className="text-xs text-rose-800 mt-0.5">
+              {geminiStatusMessage(backendStatus.geminiStatus) || backendStatus.geminiMessage || 'Gemini extraction is not ready on the server.'}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {backendStatus.checked && backendStatus.running && backendStatus.geminiConfigured && backendStatus.geminiModelAvailable && (
         <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-3 flex items-center gap-2">
           <Wifi className="h-4 w-4 text-emerald-600 shrink-0" />
           <p className="text-xs font-bold text-emerald-800">
-            Gemini AI extraction server is running and ready.
+            Gemini AI extraction server is running, authenticated and ready.
           </p>
         </div>
       )}

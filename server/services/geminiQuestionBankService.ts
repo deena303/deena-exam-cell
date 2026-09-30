@@ -1,10 +1,17 @@
-import { GoogleGenAI } from '@google/genai';
 import { EXTRACTION_PROMPT, EXTRACTION_RESPONSE_SCHEMA } from '../schemas/questionBankSchema';
 import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
-import { isGeminiAuthError, requireGeminiApiKey } from './geminiConfig';
-
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
+import {
+  GeminiServiceError,
+  classifyGeminiError,
+  getActiveGeminiModel,
+  getGeminiClient,
+  getGeminiModelCandidates,
+  isGeminiAuthError,
+  logGeminiFailure,
+  requireGeminiApiKey,
+  sanitizeForLog
+} from './gemini';
 
 interface GeminiExtractedQuestion {
   questionNumber?: string;
@@ -137,29 +144,23 @@ export async function extractQuestionsWithGemini(
   pdfBuffer: Buffer,
   fileName: string
 ): Promise<GeminiExtractionResult> {
-  const apiKey = requireGeminiApiKey();
+  requireGeminiApiKey();
 
-  const ai = new GoogleGenAI({ apiKey });
+  // Shared client + model list from the centralized Gemini service — the exact
+  // same configuration that /api/health authenticates against.
+  const ai = getGeminiClient();
   const base64Pdf = pdfBuffer.toString('base64');
+  const activeModel = getActiveGeminiModel();
 
-  console.log(`[Gemini] Extracting questions from "${fileName}" using model ${GEMINI_MODEL}...`);
+  console.log(`[Gemini] Extracting questions from "${sanitizeForLog(fileName)}" using model ${activeModel}...`);
 
   let rawResponse: string = '';
 
-  const configuredModel = process.env.GEMINI_MODEL?.trim();
+  // Same model list the health probe verified, with the verified model first.
+  // When no probe has run yet, getActiveGeminiModel() is the configured model,
+  // which is already first in the candidate list — so the original order holds.
   const candidateModels = Array.from(
-    new Set(
-      [
-        configuredModel,
-        'gemini-3.5-flash',
-        'gemini-3.5-flash-lite',
-        'gemini-3.6-flash',
-        'gemini-3.1-flash-lite',
-        'gemini-flash-latest',
-        'gemini-2.5-flash',
-        'gemini-2.0-flash'
-      ].filter(Boolean)
-    )
+    new Set([getActiveGeminiModel(), ...getGeminiModelCandidates()].filter(Boolean))
   ) as string[];
 
   let lastError: any = null;
@@ -201,26 +202,28 @@ export async function extractQuestionsWithGemini(
         }
       } catch (err: any) {
         lastError = err;
-        const msg = err?.message || String(err);
-        const status = err?.status || err?.code;
-        const isModelUnavailable = status === 404 || msg.includes('not found') || msg.includes('no longer available');
+        const category = classifyGeminiError(err);
 
-        if (isModelUnavailable) {
+        if (category === 'MODEL_NOT_FOUND') {
           console.warn(`[Gemini] Model "${modelName}" is unavailable or deprecated. Trying next candidate model...`);
           break; // Try next candidate model
         }
 
-        const safeMsg = isGeminiAuthError(err)
-          ? 'Gemini authentication failed. Verify GEMINI_API_KEY in the backend environment.'
-          : msg;
-        console.warn(`[Gemini] Model "${modelName}" attempt ${attempt} failed: ${safeMsg}`);
-
         if (isGeminiAuthError(err)) {
-          throw new Error('Gemini authentication failed. Verify GEMINI_API_KEY in the backend environment variables and redeploy/restart the backend.');
+          // Log the category only — never the key, header or credentials.
+          logGeminiFailure(`Extraction with model "${modelName}"`, err);
+          throw new GeminiServiceError(category, `Gemini rejected the configured API key (${category}) on model ${modelName}.`, modelName);
         }
 
-        // If it's a 503 (high demand) or 429 (rate limit), pause briefly before retry
-        if (msg.includes('503') || msg.includes('high demand') || msg.includes('429')) {
+        console.warn(`[Gemini] Model "${modelName}" attempt ${attempt} failed: [${category}] ${sanitizeForLog(err?.message || err)}`);
+
+        // If it's a 429 (rate limit) or 503 (high demand), pause briefly before retry
+        if (
+          category === 'RATE_LIMITED' ||
+          category === 'QUOTA_EXCEEDED' ||
+          category === 'SERVICE_UNAVAILABLE' ||
+          category === 'NETWORK_ERROR'
+        ) {
           console.log('[Gemini] Waiting 3 seconds before retrying...');
           await new Promise((resolve) => setTimeout(resolve, 3000));
         } else {
@@ -236,10 +239,16 @@ export async function extractQuestionsWithGemini(
   }
 
   if (!rawResponse || rawResponse.trim() === '') {
-    if (isGeminiAuthError(lastError)) {
-      throw new Error('Gemini authentication failed. Verify GEMINI_API_KEY in the backend environment variables and redeploy/restart the backend.');
-    }
-    throw new Error(`Gemini API error: ${lastError?.message || 'Empty response'}. Check Gemini model availability and server logs.`);
+    // Every Gemini failure leaves here as a GeminiServiceError so the route can
+    // return the exact status-derived wording (authentication_failed,
+    // model_unavailable, rate_limited, service_unavailable, ...) instead of a
+    // raw Google error.
+    const category = classifyGeminiError(lastError);
+    logGeminiFailure('Extraction', lastError);
+    throw new GeminiServiceError(
+      category,
+      `Gemini extraction failed (${category}): ${sanitizeForLog(lastError?.message || 'Empty response')}.`
+    );
   }
 
   if (!rawResponse || rawResponse.trim() === '') {

@@ -16,7 +16,13 @@ import masterDataRouter from './routes/masterDataRoutes';
 import auditLogRouter from './routes/auditLogRoutes';
 import paperSetRouter from './routes/paperSetRoutes';
 import iatQuestionBankRouter from './routes/iatQuestionBankRoutes';
-import { checkGeminiConfig } from './services/geminiConfig';
+import {
+  authenticateGemini,
+  buildGeminiHealthPayload,
+  checkGeminiConfig,
+  overallStatusFor,
+  type GeminiHealth
+} from './services/gemini';
 
 
 const app = express();
@@ -56,21 +62,41 @@ app.use((req, _res, next) => {
   next();
 });
 
-// Dedicated health endpoint that ALWAYS returns JSON immediately
-app.get(['/health', '/api/health'], (_req, res) => {
+// Dedicated health endpoint that ALWAYS returns JSON immediately.
+//
+// The five Gemini states are reported independently and never collapsed:
+//   geminiConfigured      A — the env var exists
+//   geminiAuthenticated   B — Google accepted it on a real request
+//   geminiModelAvailable  D — the model extraction uses can be called
+//   geminiRateLimited     429 from the real response
+//   geminiStatus          the precise outcome
+// "configured" never implies "authenticated". The response NEVER contains the
+// API key, any part of it, or an auth header.
+app.get(['/health', '/api/health'], async (req, res) => {
   const supabaseUrl = (process.env.SUPABASE_URL || '').trim();
   const supabaseKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
-  const gemini = checkGeminiConfig();
+  const forceRefresh = ['1', 'true', 'yes'].includes(String(req.query?.refresh || '').toLowerCase());
+
+  let gemini: GeminiHealth;
+  try {
+    // Real authentication test: minimal models.get + generateContent.
+    // No user document is ever sent.
+    gemini = await authenticateGemini({ forceRefresh });
+  } catch {
+    // Never let diagnostics take the health endpoint down.
+    gemini = checkGeminiConfig();
+  }
+
+  const supabaseConfigured = Boolean(
+    supabaseUrl && supabaseUrl.startsWith('http') && supabaseKey && supabaseKey.length > 10
+  );
 
   return res.json({
-    status: gemini.configured ? 'ok' : 'configuration_error',
+    status: overallStatusFor(gemini),
+    environment: process.env.NODE_ENV || 'production',
+    ...buildGeminiHealthPayload(gemini, supabaseConfigured),
     supabaseUrlConfigured: Boolean(supabaseUrl && supabaseUrl.startsWith('http')),
     supabaseServiceRoleConfigured: Boolean(supabaseKey && supabaseKey.length > 10),
-    supabaseConfigured: Boolean(supabaseUrl && supabaseUrl.startsWith('http') && supabaseKey && supabaseKey.length > 10),
-    geminiConfigured: gemini.configured,
-    geminiStatus: gemini.status,
-    geminiMessage: gemini.message,
-    environment: process.env.NODE_ENV || 'production',
     timestamp: new Date().toISOString()
   });
 });

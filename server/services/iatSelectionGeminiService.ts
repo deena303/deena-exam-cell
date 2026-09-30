@@ -19,17 +19,26 @@
  * not validate, this module returns `null` and the caller keeps the
  * deterministic server-side selection.
  */
-import { GoogleGenAI } from '@google/genai';
-import { checkGeminiConfig, getGeminiApiKey, isGeminiAuthError } from './geminiConfig';
+import {
+  checkGeminiConfig,
+  classifyGeminiError,
+  getActiveGeminiModel,
+  getGeminiClient,
+  getGeminiModelCandidates,
+  isGeminiAuthError,
+  sanitizeForLog
+} from './gemini';
 import type { SourceQuestion } from './iatQuestionBankService';
 
 const SELECTION_MODEL_FALLBACKS = [
+  'gemini-2.5-flash',
+  'gemini-flash-latest',
+  'gemini-2.0-flash',
+  'gemini-2.5-flash-lite',
   'gemini-3.6-flash',
   'gemini-3.5-flash',
   'gemini-3.5-flash-lite',
-  'gemini-flash-latest',
-  'gemini-2.5-flash',
-  'gemini-2.0-flash'
+  'gemini-3.1-flash-lite'
 ];
 
 const REQUEST_TIMEOUT_MS = 25000;
@@ -100,13 +109,11 @@ export async function tryGeminiSelection(
   if (!config.configured) return null;
   if (input.partA.length === 0 && input.partBC.length === 0) return null;
 
-  const apiKey = getGeminiApiKey();
-  if (!apiKey) return null;
-
   try {
-    const ai = new GoogleGenAI({ apiKey });
-    const model = config.model || process.env.GEMINI_MODEL?.trim() || SELECTION_MODEL_FALLBACKS[0];
-    const models = [model, ...SELECTION_MODEL_FALLBACKS].filter(
+    // Shared client + model resolution from the centralized Gemini service.
+    const ai = getGeminiClient();
+    const model = getActiveGeminiModel();
+    const models = [model, ...SELECTION_MODEL_FALLBACKS, ...getGeminiModelCandidates()].filter(
       (m, i, arr) => m && arr.indexOf(m) === i
     );
 
@@ -143,10 +150,14 @@ export async function tryGeminiSelection(
         }
       } catch (err: any) {
         if (isGeminiAuthError(err)) {
-          console.warn('[iat-selection] Gemini auth error — keeping deterministic selection.');
+          console.warn(
+            `[iat-selection] Gemini auth error [${classifyGeminiError(err)}] — keeping deterministic selection.`
+          );
           return null;
         }
-        console.warn(`[iat-selection] model "${candidateModel}" failed: ${err?.message || err}`);
+        console.warn(
+          `[iat-selection] model "${candidateModel}" failed [${classifyGeminiError(err)}]: ${sanitizeForLog(err?.message || err)}`
+        );
       }
     }
 
@@ -171,7 +182,9 @@ export async function tryGeminiSelection(
 
     return { partA, partBC };
   } catch (err: any) {
-    console.warn('[iat-selection] Gemini selection failed — keeping deterministic selection:', err?.message || err);
+    console.warn(
+      `[iat-selection] Gemini selection failed [${classifyGeminiError(err)}] — keeping deterministic selection: ${sanitizeForLog(err?.message || err)}`
+    );
     return null;
   }
 }

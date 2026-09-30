@@ -47,6 +47,9 @@ export interface ExtractionResponse {
     lowConfidence: number;
   };
   error?: string;
+  /** Backend-confirmed Gemini status, used to pick the right user wording. */
+  geminiStatus?: string;
+  errorCode?: string;
 }
 
 export interface ApprovalResponse {
@@ -55,6 +58,30 @@ export interface ApprovalResponse {
   savedCount: number;
   bankId?: string;
   error?: string;
+}
+
+/**
+ * Maps a backend-confirmed Gemini status to the exact user-facing wording.
+ * An "authentication failed" message is only ever shown when the backend
+ * actually reports geminiStatus === 'authentication_failed'.
+ */
+export function geminiStatusMessage(status: string | undefined): string | null {
+  switch (status) {
+    case 'authentication_failed':
+      return 'Gemini authentication failed on the server. Please contact the administrator.';
+    case 'permission_denied':
+      return 'Gemini access was denied on the server. Please contact the administrator.';
+    case 'model_unavailable':
+      return 'Gemini model is currently unavailable. Please contact the administrator.';
+    case 'rate_limited':
+      return 'Gemini API rate limit reached. Please try again later.';
+    case 'service_unavailable':
+      return 'Gemini service is temporarily unavailable. Please try again later.';
+    case 'not_configured':
+      return 'Gemini extraction is not configured on the server. Please contact the administrator.';
+    default:
+      return null;
+  }
 }
 
 /**
@@ -108,7 +135,12 @@ export async function extractQuestionBank(
   }
 
   if (!response.ok || !result.success) {
-    throw new Error(result.error || `Extraction failed (HTTP ${response.status})`);
+    // Prefer the status-derived wording so the message always matches what the
+    // backend actually confirmed, and never leak a raw Google API error.
+    const mapped = geminiStatusMessage(result.geminiStatus);
+    throw new Error(
+      mapped || result.error || `Extraction failed (HTTP ${response.status})`
+    );
   }
 
   onProgress?.('Preparing teacher review interface...', 95);
@@ -161,26 +193,48 @@ export async function approveQuestionBank(
 
 /**
  * Checks if the backend is running and configured.
+ *
+ * `geminiConfigured` only means the key exists in the server environment.
+ * `geminiAuthenticated` means a real Gemini API request succeeded.
  */
 export async function checkBackendHealth(): Promise<{
   running: boolean;
   geminiConfigured: boolean;
+  geminiAuthenticated: boolean;
+  geminiModelAvailable: boolean;
   geminiStatus?: string;
   geminiMessage?: string;
   supabaseConfigured: boolean;
 }> {
   try {
-    const response = await fetch('/api/health', { signal: AbortSignal.timeout(3000) });
-    if (!response.ok) return { running: false, geminiConfigured: false, supabaseConfigured: false };
+    const response = await fetch('/api/health', { signal: AbortSignal.timeout(8000) });
+    if (!response.ok) {
+      return {
+        running: false,
+        geminiConfigured: false,
+        geminiAuthenticated: false,
+        geminiModelAvailable: false,
+        supabaseConfigured: false
+      };
+    }
     const data = await response.json();
     return {
-      running: data.status === 'ok' || data.status === 'configuration_error',
+      // "degraded" still means the API is up and answering.
+      running: data.status === 'ok' || data.status === 'degraded' || data.status === 'configuration_error',
       geminiConfigured: !!data.geminiConfigured,
+      geminiAuthenticated: !!data.geminiAuthenticated,
+      geminiModelAvailable: !!data.geminiModelAvailable,
       geminiStatus: data.geminiStatus,
       geminiMessage: data.geminiMessage,
       supabaseConfigured: !!data.supabaseConfigured
     };
   } catch {
-    return { running: false, geminiConfigured: false, supabaseConfigured: false };
+    return {
+      running: false,
+      geminiConfigured: false,
+      geminiAuthenticated: false,
+      geminiModelAvailable: false,
+      supabaseConfigured: false
+    };
   }
 }

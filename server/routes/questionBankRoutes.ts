@@ -14,7 +14,16 @@ import {
   getQuestionBankCount,
   getQuestionBanks
 } from '../services/supabaseQuestionBankService';
-import { checkGeminiConfig } from '../services/geminiConfig';
+import {
+  authenticateGemini,
+  buildGeminiHealthPayload,
+  checkGeminiConfig,
+  httpStatusForStatus,
+  isDefinitiveGeminiFailure,
+  isGeminiServiceError,
+  overallStatusFor,
+  type GeminiHealth
+} from '../services/gemini';
 import { writeAuditLog, AUDIT_ACTIONS } from '../services/auditService';
 
 const router = express.Router();
@@ -41,10 +50,18 @@ const upload = multer({
 /**
  * GET /api/health
  * Liveness probe — confirms backend is running and shared env vars are loaded.
+ * Performs the same real Gemini authentication test as the top-level /api/health
+ * route so both agree on the credential.
  */
-router.get('/health', async (_req: Request, res: Response) => {
+router.get('/health', async (req: Request, res: Response) => {
   const supabaseOk = isSupabaseConfigured();
-  const gemini = checkGeminiConfig();
+  const forceRefresh = ['1', 'true', 'yes'].includes(String(req.query?.refresh || '').toLowerCase());
+  let gemini: GeminiHealth;
+  try {
+    gemini = await authenticateGemini({ forceRefresh });
+  } catch {
+    gemini = checkGeminiConfig();
+  }
   let tablesOk = false;
   let missingTables: string[] = [];
 
@@ -59,11 +76,9 @@ router.get('/health', async (_req: Request, res: Response) => {
   }
 
   res.json({
-    status: gemini.configured ? 'ok' : 'configuration_error',
-    geminiConfigured: gemini.configured,
-    geminiStatus: gemini.status,
-    geminiMessage: gemini.message,
-    supabaseConfigured: supabaseOk,
+    status: overallStatusFor(gemini),
+    environment: process.env.NODE_ENV || 'production',
+    ...buildGeminiHealthPayload(gemini, supabaseOk),
     supabaseTablesReady: tablesOk,
     missingTables: missingTables.length > 0 ? missingTables : undefined,
     timestamp: new Date().toISOString()
@@ -146,8 +161,28 @@ router.post(
       if (!gemini.configured) {
         return res.status(503).json({
           success: false,
-          error: gemini.message,
+          error: gemini.userMessage || 'Gemini is not configured on the server.',
+          geminiStatus: gemini.status,
           configurationError: true,
+          service: 'gemini'
+        });
+      }
+
+      // Real authentication test, using the same centralized Gemini service and
+      // the same resolved model that performs the extraction below. Cached for
+      // 60s, so this is effectively free in normal operation.
+      //
+      // Only definitive verdicts short-circuit. Rate limits and capacity errors
+      // fall through to the extraction service, which has its own retry walk.
+      const auth = await authenticateGemini();
+      if (isDefinitiveGeminiFailure(auth)) {
+        return res.status(httpStatusForStatus(auth.status)).json({
+          success: false,
+          // Only ever the status-derived wording, never a raw Google error.
+          error: auth.userMessage,
+          geminiStatus: auth.status,
+          errorCode: auth.errorCategory,
+          configurationError: auth.status === 'not_configured',
           service: 'gemini'
         });
       }
@@ -300,6 +335,18 @@ router.post(
         }
       });
     } catch (err: any) {
+      if (isGeminiServiceError(err)) {
+        // Log the category only — never the key, header or raw credentials.
+        console.error('[Extract] Gemini failure');
+        console.error(`[Extract] Error category: ${err.category}`);
+        return res.status(err.httpStatus || 503).json({
+          success: false,
+          error: err.userMessage,
+          geminiStatus: err.status,
+          errorCode: err.category,
+          service: 'gemini'
+        });
+      }
       console.error('[Extract] Fatal error:', err?.message || err);
       return res.status(500).json({
         error: err?.message || 'Extraction failed. Check server logs.',
