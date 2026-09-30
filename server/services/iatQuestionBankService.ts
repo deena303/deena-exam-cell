@@ -81,6 +81,41 @@ function db(): ReturnType<typeof getSupabaseClient> {
 
 export type QuestionPart = 'Part A' | 'Part B' | 'Part C';
 
+/**
+ * The literal source discriminator (Spec §3).
+ *
+ *   "original" — the complete question bank uploaded by the user.
+ *   "reduced"  — a controlled subset created from an original bank.
+ *
+ * `question_banks.bank_type` ('ORIGINAL' | 'IAT_GENERATED') is the legacy
+ * spelling and is still the storage format; these two helpers are the only
+ * place that translation happens.
+ */
+export type QuestionBankSourceType = 'original' | 'reduced';
+
+export const ORIGINAL_BANK_TYPE: QuestionBankSourceType = 'original';
+export const REDUCED_BANK_TYPE: QuestionBankSourceType = 'reduced';
+
+/** Accepts either spelling from the client and returns the canonical value. */
+export function normalizeQuestionBankType(value: unknown): QuestionBankSourceType | null {
+  if (typeof value !== 'string') return null;
+  const v = value.trim().toLowerCase();
+  if (v === 'original') return 'original';
+  if (v === 'reduced' || v === 'screened' || v === 'iat_generated' || v === 'iat-generated') return 'reduced';
+  return null;
+}
+
+/** Canonical type -> the legacy `question_banks.bank_type` value. */
+export function toLegacyBankType(type: QuestionBankSourceType): 'ORIGINAL' | 'IAT_GENERATED' {
+  return type === 'reduced' ? 'IAT_GENERATED' : 'ORIGINAL';
+}
+
+/** Reads the canonical type off a bank row, tolerating a pre-013 database. */
+export function readQuestionBankType(bank: Record<string, any> | null | undefined): QuestionBankSourceType {
+  if (!bank) return 'original';
+  return normalizeQuestionBankType(bank.question_bank_type) ?? (bank.bank_type === 'IAT_GENERATED' ? 'reduced' : 'original');
+}
+
 /** A question as read from the ORIGINAL `questions` table. */
 export interface SourceQuestion {
   id: string;
@@ -121,6 +156,12 @@ export interface SourceBankStats {
 
 export interface SelectedQuestion {
   sourceQuestionId: string;
+  /**
+   * The ORIGINAL `questions.id` this was selected from (Spec §12).
+   * Always identical to `sourceQuestionId` — exposed under the spec's name so
+   * the UI can render "Source: Original Question #<id>".
+   */
+  originalQuestionId: string;
   sourceQuestionNumber: string;
   questionText: string;
   /** ALWAYS the original part of the source question (Spec §6) */
@@ -430,14 +471,66 @@ export interface CountValidation {
 }
 
 // ====================================================================
-// Unit-wise request types (Spec §1 new requirements)
+// Unit-wise request types (Spec §5, §6)
 // ====================================================================
 
-/** Per-unit requested counts submitted from the frontend. */
+/**
+ * Raw per-unit request as submitted by the client.
+ *
+ * The Exam Cell may specify Part A, Part B and Part C independently
+ * (Spec §5, e.g. Part A -> 10, Part B -> 5, Part C -> 2). `partBC` is the
+ * legacy combined form and is still accepted; when `partB` / `partC` are
+ * supplied they win and `partBC` is derived from them.
+ */
+export interface UnitRequestInput {
+  unit: number;
+  partA?: number | string | null;
+  partB?: number | string | null;
+  partC?: number | string | null;
+  partBC?: number | string | null;
+}
+
+/** Normalised per-unit request: every part has an explicit, exact count. */
 export interface UnitRequest {
   unit: number;   // 1–5
   partA: number;  // requested Part A questions from this unit
-  partBC: number; // requested Part B+C questions from this unit (combined pool)
+  partB: number;  // requested Part B questions from this unit
+  partC: number;  // requested Part C questions from this unit
+  /** Part B + Part C combined. Always equal to partB + partC after normalising. */
+  partBC: number;
+}
+
+function toCount(value: unknown): number {
+  if (value === null || value === undefined || value === '') return 0;
+  const n = typeof value === 'number' ? value : Number(String(value).trim());
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) return Number.NaN;
+  return n;
+}
+
+/**
+ * Turns raw client input into exact per-part counts. Returns `null` when a
+ * value is not a non-negative whole number so the caller can reject it with
+ * a precise message instead of silently coercing it.
+ */
+export function normalizeUnitRequests(input: UnitRequestInput[]): UnitRequest[] | null {
+  const out: UnitRequest[] = [];
+  for (const raw of input) {
+    const unit = Number(raw.unit);
+    if (!Number.isInteger(unit) || unit < 1 || unit > 5) return null;
+
+    const partA = toCount(raw.partA);
+    const hasSplit = raw.partB !== null && raw.partB !== undefined && raw.partB !== '';
+    const hasPartB = hasSplit || (raw.partC !== null && raw.partC !== undefined && raw.partC !== '');
+    const partB = toCount(hasPartB ? raw.partB : null);
+    const partC = toCount(hasPartB ? raw.partC : null);
+    const partBC = hasPartB ? partB + partC : toCount(raw.partBC);
+
+    if (Number.isNaN(partA) || Number.isNaN(partB) || Number.isNaN(partC) || Number.isNaN(partBC)) {
+      return null;
+    }
+    out.push({ unit, partA, partB, partC, partBC });
+  }
+  return out;
 }
 
 /** Validation result for a single unit's request. */
@@ -446,45 +539,91 @@ export interface UnitValidationResult {
   valid: boolean;
   errors: string[];
   availablePartA: number;
+  availablePartB: number;
+  availablePartC: number;
   availablePartBC: number;
 }
 
 /**
- * Validates per-unit requested counts against what is actually available
- * in the source bank for that unit.
+ * Validates per-unit requested counts against what is actually available in
+ * the source bank for that unit. A unit that requests more Part B questions
+ * than it holds is a hard error — the system never silently reduces the
+ * requested quantity (Spec §6, §16).
  */
 export function validateUnitRequests(
   questions: SourceQuestion[],
   unitRequests: UnitRequest[]
 ): UnitValidationResult[] {
-  // Build per-unit availability map
-  const byUnit = new Map<number, { partA: number; partBC: number }>();
+  const byUnit = new Map<number, { partA: number; partB: number; partC: number }>();
   for (const q of questions) {
     const u = typeof q.unit === 'number' && q.unit >= 1 && q.unit <= 5 ? q.unit : 0;
-    const b = byUnit.get(u) || { partA: 0, partBC: 0 };
+    const b = byUnit.get(u) || { partA: 0, partB: 0, partC: 0 };
     if (q.part === 'Part A') b.partA++;
-    else b.partBC++;
+    else if (q.part === 'Part C') b.partC++;
+    else b.partB++;
     byUnit.set(u, b);
   }
 
   return unitRequests.map((req) => {
-    const avail = byUnit.get(req.unit) || { partA: 0, partBC: 0 };
+    const avail = byUnit.get(req.unit) || { partA: 0, partB: 0, partC: 0 };
     const errors: string[] = [];
     if (!Number.isInteger(req.partA) || req.partA < 0)
       errors.push(`Unit ${req.unit}: Part A count must be a non-negative integer.`);
     else if (req.partA > avail.partA)
       errors.push(`Unit ${req.unit}: Requested ${req.partA} Part A questions but only ${avail.partA} available.`);
-    if (!Number.isInteger(req.partBC) || req.partBC < 0)
-      errors.push(`Unit ${req.unit}: Part B/C count must be a non-negative integer.`);
-    else if (req.partBC > avail.partBC)
-      errors.push(`Unit ${req.unit}: Requested ${req.partBC} Part B/C questions but only ${avail.partBC} available.`);
+    if (!Number.isInteger(req.partB) || req.partB < 0)
+      errors.push(`Unit ${req.unit}: Part B count must be a non-negative integer.`);
+    else if (req.partB > avail.partB)
+      errors.push(`Unit ${req.unit}: Requested ${req.partB} Part B questions but only ${avail.partB} available.`);
+    if (!Number.isInteger(req.partC) || req.partC < 0)
+      errors.push(`Unit ${req.unit}: Part C count must be a non-negative integer.`);
+    else if (req.partC > avail.partC)
+      errors.push(`Unit ${req.unit}: Requested ${req.partC} Part C questions but only ${avail.partC} available.`);
     return {
       unit: req.unit,
       valid: errors.length === 0,
       errors,
       availablePartA: avail.partA,
-      availablePartBC: avail.partBC
+      availablePartB: avail.partB,
+      availablePartC: avail.partC,
+      availablePartBC: avail.partB + avail.partC
     };
+  });
+}
+
+/**
+ * Balanced default distribution across the five units (Spec §6).
+ *
+ * Used when the Exam Cell does not specify unit-wise quantities. The result
+ * is always returned to the UI so the distribution can be shown BEFORE
+ * saving — it is never applied silently behind the user's back.
+ */
+export function proposeBalancedUnitDistribution(
+  questions: SourceQuestion[],
+  requested: { partA: number; partB: number; partC: number }
+): UnitRequest[] {
+  const byUnit = new Map<number, { partA: number; partB: number; partC: number }>();
+  for (const q of questions) {
+    const u = typeof q.unit === 'number' && q.unit >= 1 && q.unit <= 5 ? q.unit : 0;
+    const b = byUnit.get(u) || { partA: 0, partB: 0, partC: 0 };
+    if (q.part === 'Part A') b.partA++;
+    else if (q.part === 'Part C') b.partC++;
+    else b.partB++;
+    byUnit.set(u, b);
+  }
+  const units = [1, 2, 3, 4, 5];
+  const capFor = (part: 'partA' | 'partB' | 'partC') =>
+    new Map<number, number>(units.map((u) => [u, byUnit.get(u)?.[part] ?? 0]));
+
+  const distA = allocateUnits(units, capFor('partA'), requested.partA);
+  const distB = allocateUnits(units, capFor('partB'), requested.partB);
+  const distC = allocateUnits(units, capFor('partC'), requested.partC);
+
+  return units.map((unit) => {
+    const partA = distA.get(unit) || 0;
+    const partB = distB.get(unit) || 0;
+    const partC = distC.get(unit) || 0;
+    return { unit, partA, partB, partC, partBC: partB + partC };
   });
 }
 
@@ -830,6 +969,7 @@ function toSelected(
 ): SelectedQuestion {
   return {
     sourceQuestionId: q.id,
+    originalQuestionId: q.id,
     sourceQuestionNumber: `${ordinal + 1}.`,
     questionText: q.question_text,
     originalPart: q.part,
