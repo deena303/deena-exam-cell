@@ -37,9 +37,26 @@ import {
 const EXAM_TYPE_OPTIONS = ['Internal Assessment I', 'Internal Assessment II'] as const;
 const ALL_UNITS = [1, 2, 3, 4, 5] as const;
 
-// Default per-unit counts (editable by user)
+// Default per-unit counts — always numeric 0, never undefined/null/string.
 function makeDefaultUnitRequests(): UnitRequest[] {
   return ALL_UNITS.map((u) => ({ unit: u, partA: 0, partBC: 0 }));
+}
+
+/** Safely convert a raw input value to a non-negative integer. Returns 0 for empty/invalid. */
+function safeCount(raw: string | number | undefined | null): number {
+  if (raw === '' || raw === undefined || raw === null) return 0;
+  const n = typeof raw === 'number' ? raw : Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) return 0;
+  return n;
+}
+
+/** Normalize all unit requests to exact integers before sending to the API. */
+function normalizeUnitRequestsForApi(requests: UnitRequest[]): UnitRequest[] {
+  return requests.map((r) => ({
+    unit: r.unit,
+    partA: safeCount(r.partA),
+    partBC: safeCount(r.partBC)
+  }));
 }
 
 // Per-unit availability from SourceBankStats
@@ -191,23 +208,26 @@ export const IatQuestionBankGeneratorView: React.FC = () => {
     [stats]
   );
 
-  // ---- Per-unit validation ----
+  // ---- Per-unit validation (uses safeCount so 0-valued fields never cause spurious errors) ----
   const unitValidationErrors = useMemo(() => {
     if (!stats) return [];
     const out: string[] = [];
     for (const req of unitRequests) {
       const avail = unitAvailability.get(req.unit) || { partA: 0, partBC: 0 };
-      if (!Number.isInteger(req.partA) || req.partA < 0)
+      const partA  = safeCount(req.partA);
+      const partBC = safeCount(req.partBC);
+      // Only flag actual bad values — a cleared/0 field is always valid
+      if (req.partA !== 0 && (isNaN(Number(req.partA)) || Number(req.partA) < 0 || !Number.isInteger(Number(req.partA))))
         out.push(`Unit ${req.unit}: Part A must be a non-negative integer.`);
-      else if (req.partA > avail.partA)
-        out.push(`Unit ${req.unit}: Requested ${req.partA} Part A but only ${avail.partA} available.`);
-      if (!Number.isInteger(req.partBC) || req.partBC < 0)
+      else if (partA > avail.partA)
+        out.push(`Unit ${req.unit}: Requested ${partA} Part A but only ${avail.partA} available.`);
+      if (req.partBC !== 0 && (isNaN(Number(req.partBC)) || Number(req.partBC) < 0 || !Number.isInteger(Number(req.partBC))))
         out.push(`Unit ${req.unit}: Part B/C must be a non-negative integer.`);
-      else if (req.partBC > avail.partBC)
-        out.push(`Unit ${req.unit}: Requested ${req.partBC} Part B/C but only ${avail.partBC} available.`);
+      else if (partBC > avail.partBC)
+        out.push(`Unit ${req.unit}: Requested ${partBC} Part B/C but only ${avail.partBC} available.`);
     }
-    const totalA = unitRequests.reduce((s, r) => s + r.partA, 0);
-    const totalBC = unitRequests.reduce((s, r) => s + r.partBC, 0);
+    const totalA  = unitRequests.reduce((s, r) => s + safeCount(r.partA),  0);
+    const totalBC = unitRequests.reduce((s, r) => s + safeCount(r.partBC), 0);
     if (totalA === 0 && totalBC === 0)
       out.push('Enter at least one question across all units.');
     return out;
@@ -217,7 +237,9 @@ export const IatQuestionBankGeneratorView: React.FC = () => {
 
   // ---- Update a single unit's count ----
   const setUnitField = (unit: number, field: 'partA' | 'partBC', raw: string) => {
-    const val = raw === '' ? 0 : Math.max(0, parseInt(raw, 10) || 0);
+    // Allow the field to be empty while the user is typing, but store 0 for
+    // calculation purposes so totals and validation always work with numbers.
+    const val = raw === '' ? 0 : Math.max(0, Math.floor(Number(raw) || 0));
     setUnitRequests((prev) =>
       prev.map((r) => (r.unit === unit ? { ...r, [field]: val } : r))
     );
@@ -227,8 +249,30 @@ export const IatQuestionBankGeneratorView: React.FC = () => {
 
   // ---- Generate / Regenerate ----
   const runGeneration = async (useNewSeed: boolean) => {
-    if (!stats || unitValidationErrors.length > 0) {
-      setErrors(unitValidationErrors);
+    // Final client-side normalization — BEFORE validation, so 0s are valid.
+    const normalized = normalizeUnitRequestsForApi(unitRequests);
+    const normalizedErrors: string[] = [];
+    if (stats) {
+      for (const req of normalized) {
+        const avail = unitAvailability.get(req.unit) || { partA: 0, partBC: 0 };
+        const partA = safeCount(req.partA);
+        const partBC = safeCount(req.partBC);
+        if (!Number.isInteger(partA) || partA < 0)
+          normalizedErrors.push(`Unit ${req.unit}: Part A must be a non-negative integer.`);
+        else if (partA > avail.partA)
+          normalizedErrors.push(`Unit ${req.unit}: Requested ${partA} Part A but only ${avail.partA} available.`);
+        if (!Number.isInteger(partBC) || partBC < 0)
+          normalizedErrors.push(`Unit ${req.unit}: Part B/C must be a non-negative integer.`);
+        else if (partBC > avail.partBC)
+          normalizedErrors.push(`Unit ${req.unit}: Requested ${partBC} Part B/C but only ${avail.partBC} available.`);
+      }
+      const totalA = normalized.reduce((s, r) => s + safeCount(r.partA), 0);
+      const totalBC = normalized.reduce((s, r) => s + safeCount(r.partBC), 0);
+      if (totalA === 0 && totalBC === 0)
+        normalizedErrors.push('Enter at least one question across all units.');
+    }
+    if (!stats || normalizedErrors.length > 0) {
+      setErrors(normalizedErrors.length > 0 ? normalizedErrors : unitValidationErrors);
       return;
     }
     setGenerating(true);
@@ -236,8 +280,8 @@ export const IatQuestionBankGeneratorView: React.FC = () => {
     setSaveError(null);
     const nextSeed = useNewSeed || seed === undefined ? Math.floor(Math.random() * 2 ** 31) : seed;
     try {
-      // Filter out units with 0 for both counts
-      const activeRequests = unitRequests.filter((r) => r.partA > 0 || r.partBC > 0);
+      // Send only units that have at least one question requested; all values are guaranteed integers.
+      const activeRequests = normalized.filter((r) => r.partA > 0 || r.partBC > 0);
       const result = await generateIatPreview(token, {
         sourceQuestionBankId: sourceBankId,
         requestedPartA: 0,
@@ -270,15 +314,17 @@ export const IatQuestionBankGeneratorView: React.FC = () => {
     setSaving(true);
     setSaveError(null);
     try {
-      const activeRequests = unitRequests.filter((r) => r.partA > 0 || r.partBC > 0);
+      // Normalize once more before saving — guarantees no empty strings reach the API.
+      const normalizedForSave = normalizeUnitRequestsForApi(unitRequests)
+        .filter((r) => r.partA > 0 || r.partBC > 0);
       const result = await saveIatGeneratedBank(token, {
         sourceQuestionBankId: preview.sourceBankId,
-        requestedPartA: preview.requestedPartA,
-        requestedPartBC: preview.requestedPartBC,
+        requestedPartA: safeCount(preview.requestedPartA),
+        requestedPartBC: safeCount(preview.requestedPartBC),
         examType,
         name: bankName.trim() || preview.suggestedName,
         seed: preview.seed,
-        unitRequests: activeRequests
+        unitRequests: normalizedForSave
       });
       setSavedBank(result.generatedBank);
       setPreview(null);
@@ -393,9 +439,9 @@ export const IatQuestionBankGeneratorView: React.FC = () => {
     </div>
   );
 
-  // Per-unit row totals
-  const totalRequestedA = unitRequests.reduce((s, r) => s + r.partA, 0);
-  const totalRequestedBC = unitRequests.reduce((s, r) => s + r.partBC, 0);
+  // Per-unit row totals — always computed from safe numeric values.
+  const totalRequestedA = unitRequests.reduce((s, r) => s + safeCount(r.partA), 0);
+  const totalRequestedBC = unitRequests.reduce((s, r) => s + safeCount(r.partBC), 0);
   const totalRequested = totalRequestedA + totalRequestedBC;
 
   // ==================================================================
@@ -693,14 +739,15 @@ export const IatQuestionBankGeneratorView: React.FC = () => {
                               type="number"
                               min={0}
                               max={avail.partA}
-                              value={req.partA === 0 ? '' : req.partA}
+                              step={1}
+                              value={safeCount(req.partA) === 0 ? '' : safeCount(req.partA)}
                               placeholder="0"
                               onChange={(e) => setUnitField(req.unit, 'partA', e.target.value)}
                               className={`${inputClass} w-20 ${
-                                req.partA > avail.partA ? 'border-red-400 bg-red-50 focus:ring-red-400/20' : ''
+                                safeCount(req.partA) > avail.partA ? 'border-red-400 bg-red-50 focus:ring-red-400/20' : ''
                               }`}
                             />
-                            {req.partA > avail.partA && (
+                            {safeCount(req.partA) > avail.partA && (
                               <div className="mt-0.5 text-[9px] font-bold text-red-600">max {avail.partA}</div>
                             )}
                           </td>
@@ -709,14 +756,15 @@ export const IatQuestionBankGeneratorView: React.FC = () => {
                               type="number"
                               min={0}
                               max={avail.partBC}
-                              value={req.partBC === 0 ? '' : req.partBC}
+                              step={1}
+                              value={safeCount(req.partBC) === 0 ? '' : safeCount(req.partBC)}
                               placeholder="0"
                               onChange={(e) => setUnitField(req.unit, 'partBC', e.target.value)}
                               className={`${inputClass} w-20 ${
-                                req.partBC > avail.partBC ? 'border-red-400 bg-red-50 focus:ring-red-400/20' : ''
+                                safeCount(req.partBC) > avail.partBC ? 'border-red-400 bg-red-50 focus:ring-red-400/20' : ''
                               }`}
                             />
-                            {req.partBC > avail.partBC && (
+                            {safeCount(req.partBC) > avail.partBC && (
                               <div className="mt-0.5 text-[9px] font-bold text-red-600">max {avail.partBC}</div>
                             )}
                           </td>

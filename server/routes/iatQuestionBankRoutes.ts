@@ -166,17 +166,29 @@ router.post('/iat-question-banks/preview', ...iatAccess, async (req: Authenticat
         requestedPartBC: 0,
         examType: resolvedExamType,
         seed: seed === undefined || seed === null ? undefined : Number(seed),
-        unitRequests: unitRequests.map((r: any) => ({
-          unit: Number(r.unit),
-          partA: Number(r.partA),
-          partBC: Number(r.partBC)
-        }))
+        unitRequests: unitRequests.map((r: any) => {
+          const partA   = Number(r.partA   ?? 0) || 0;
+          // Support both combined partBC and separate partB/partC from client
+          const hasPartB = r.partB !== undefined && r.partB !== null && r.partB !== '';
+          const hasPartC = r.partC !== undefined && r.partC !== null && r.partC !== '';
+          const hasSplit = hasPartB || hasPartC;
+          const partB   = hasSplit ? (Number(r.partB  ?? 0) || 0) : 0;
+          const partC   = hasSplit ? (Number(r.partC  ?? 0) || 0) : 0;
+          const partBC  = hasSplit ? partB + partC : (Number(r.partBC ?? 0) || 0);
+          return {
+            unit:   Number(r.unit),
+            partA:  Math.max(0, Math.floor(partA)),
+            partB:  Math.max(0, Math.floor(partB)),
+            partC:  Math.max(0, Math.floor(partC)),
+            partBC: Math.max(0, Math.floor(partBC))
+          };
+        })
       });
     } else {
       preview = await generateIatPreview({
         sourceQuestionBankId: String(sourceQuestionBankId),
-        requestedPartA: Number(requestedPartA),
-        requestedPartBC: Number(requestedPartBC),
+        requestedPartA: Number(requestedPartA) || 0,
+        requestedPartBC: Number(requestedPartBC) || 0,
         examType: resolvedExamType,
         seed: seed === undefined || seed === null ? undefined : Number(seed),
         useGemini: Boolean(useGemini)
@@ -205,15 +217,26 @@ router.post('/iat-question-banks', ...iatAccess, async (req: AuthenticatedReques
 
     const isUnitWise = Array.isArray(unitRequests) && unitRequests.length > 0;
     const parsedUnitRequests = isUnitWise
-      ? unitRequests.map((r: any) => ({
-          unit: Number(r.unit),
-          partA: Number(r.partA),
-          partBC: Number(r.partBC)
-        }))
+      ? unitRequests.map((r: any) => {
+          const partA   = Number(r.partA   ?? 0) || 0;
+          const hasPartB = r.partB !== undefined && r.partB !== null && r.partB !== '';
+          const hasPartC = r.partC !== undefined && r.partC !== null && r.partC !== '';
+          const hasSplit = hasPartB || hasPartC;
+          const partB   = hasSplit ? (Number(r.partB  ?? 0) || 0) : 0;
+          const partC   = hasSplit ? (Number(r.partC  ?? 0) || 0) : 0;
+          const partBC  = hasSplit ? partB + partC : (Number(r.partBC ?? 0) || 0);
+          return {
+            unit:   Number(r.unit),
+            partA:  Math.max(0, Math.floor(partA)),
+            partB:  Math.max(0, Math.floor(partB)),
+            partC:  Math.max(0, Math.floor(partC)),
+            partBC: Math.max(0, Math.floor(partBC))
+          };
+        })
       : undefined;
 
-    const totalA = isUnitWise ? parsedUnitRequests!.reduce((s: number, r: any) => s + r.partA, 0) : Number(requestedPartA);
-    const totalBC = isUnitWise ? parsedUnitRequests!.reduce((s: number, r: any) => s + r.partBC, 0) : Number(requestedPartBC);
+    const totalA = isUnitWise ? parsedUnitRequests!.reduce((s: number, r: any) => s + r.partA, 0) : (Number(requestedPartA) || 0);
+    const totalBC = isUnitWise ? parsedUnitRequests!.reduce((s: number, r: any) => s + r.partBC, 0) : (Number(requestedPartBC) || 0);
 
     const { generatedBank, preview } = await saveGeneratedBank({
       sourceQuestionBankId: String(sourceQuestionBankId),

@@ -567,18 +567,25 @@ export function validateUnitRequests(
   return unitRequests.map((req) => {
     const avail = byUnit.get(req.unit) || { partA: 0, partB: 0, partC: 0 };
     const errors: string[] = [];
-    if (!Number.isInteger(req.partA) || req.partA < 0)
+
+    // Safely coerce fields — undefined/null/NaN become 0 so missing fields
+    // (e.g. when client sends only partBC) never produce spurious errors.
+    const reqPartA  = Number.isFinite(req.partA)  && Number.isInteger(req.partA)  ? req.partA  : (Number(req.partA  ?? 0) || 0);
+    const reqPartB  = Number.isFinite(req.partB)  && Number.isInteger(req.partB)  ? req.partB  : (Number(req.partB  ?? 0) || 0);
+    const reqPartC  = Number.isFinite(req.partC)  && Number.isInteger(req.partC)  ? req.partC  : (Number(req.partC  ?? 0) || 0);
+
+    if (!Number.isInteger(reqPartA) || reqPartA < 0)
       errors.push(`Unit ${req.unit}: Part A count must be a non-negative integer.`);
-    else if (req.partA > avail.partA)
-      errors.push(`Unit ${req.unit}: Requested ${req.partA} Part A questions but only ${avail.partA} available.`);
-    if (!Number.isInteger(req.partB) || req.partB < 0)
+    else if (reqPartA > avail.partA)
+      errors.push(`Unit ${req.unit}: Requested ${reqPartA} Part A questions but only ${avail.partA} available.`);
+    if (!Number.isInteger(reqPartB) || reqPartB < 0)
       errors.push(`Unit ${req.unit}: Part B count must be a non-negative integer.`);
-    else if (req.partB > avail.partB)
-      errors.push(`Unit ${req.unit}: Requested ${req.partB} Part B questions but only ${avail.partB} available.`);
-    if (!Number.isInteger(req.partC) || req.partC < 0)
+    else if (reqPartB > avail.partB)
+      errors.push(`Unit ${req.unit}: Requested ${reqPartB} Part B questions but only ${avail.partB} available.`);
+    if (!Number.isInteger(reqPartC) || reqPartC < 0)
       errors.push(`Unit ${req.unit}: Part C count must be a non-negative integer.`);
-    else if (req.partC > avail.partC)
-      errors.push(`Unit ${req.unit}: Requested ${req.partC} Part C questions but only ${avail.partC} available.`);
+    else if (reqPartC > avail.partC)
+      errors.push(`Unit ${req.unit}: Requested ${reqPartC} Part C questions but only ${avail.partC} available.`);
     return {
       unit: req.unit,
       valid: errors.length === 0,
@@ -1622,6 +1629,7 @@ export async function getGeneratedBank(id: string): Promise<GeneratedBankDetail 
 
   const questions: SelectedQuestion[] = (rows || []).map((r: any) => ({
     sourceQuestionId: r.source_question_id,
+    originalQuestionId: r.source_question_id,
     sourceQuestionNumber: r.source_question_number || '',
     questionText: r.question_text,
     originalPart: normalizePart(r.original_part),
